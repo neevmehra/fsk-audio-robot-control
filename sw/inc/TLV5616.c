@@ -28,16 +28,30 @@
 #include <stdint.h>
 #include "../inc/tm4c123gh6pm.h"
 
+#define TLV5616_CMD(code) (0x1000 | ((code) & 0x0FFF))
+
 //----------------   DAC_Init     -------------------------------------------
 // Initialize TLV5616 12-bit DAC
 // assumes bus clock is 80 MHz
 // inputs: initial voltage output (0 to 4095)
 // outputs:none
 void DAC_Init(uint16_t data){
-    // write this
-	  // Consider the following registers:
-	  // SYSCTL_RCGCSSI_R, SSI1_CR1_R, SSI1_CPSR_R, SSI1_CR0_R, SSI1_DR_R, SSI1_CR1_R
+  volatile uint32_t delay;
+  SYSCTL_RCGCSSI_R |= 0x02;      // activate SSI1
+  SYSCTL_RCGCGPIO_R |= 0x08;     // activate Port D
+  delay = SYSCTL_RCGCGPIO_R;
+  (void)delay;
 
+  GPIO_PORTD_AFSEL_R |= 0x0B;    // PD3,PD1,PD0 alternate function
+  GPIO_PORTD_DEN_R |= 0x0B;      // digital enable
+  GPIO_PORTD_AMSEL_R &= ~0x0B;   // disable analog
+  GPIO_PORTD_PCTL_R = (GPIO_PORTD_PCTL_R&0xFFFF0F00) + 0x00002022;
+
+  SSI1_CR1_R = 0x00000000;       // disable SSI during config
+  SSI1_CPSR_R = 4;               // 20 MHz SSI clock with 80 MHz bus
+  SSI1_CR0_R = 0x0000000F;       // Freescale, SPO=0, SPH=0, 16-bit
+  SSI1_DR_R = TLV5616_CMD(data); // preload first sample
+  SSI1_CR1_R = 0x00000002;       // enable SSI
 }
 
 // --------------     DAC_Out   --------------------------------------------
@@ -45,9 +59,8 @@ void DAC_Init(uint16_t data){
 // inputs:  voltage output (0 to 4095)
 // 
 void DAC_Out(uint16_t code){
-    // write this
-    // Consider the following registers:
-	  // SSI1_SR_R, SSI1_DR_R
+  while((SSI1_SR_R&SSI_SR_TNF) == 0){};
+  SSI1_DR_R = TLV5616_CMD(code);
 }
 
 // --------------     DAC_OutNonBlocking   ------------------------------------
@@ -55,7 +68,5 @@ void DAC_Out(uint16_t code){
 // inputs:  voltage output (0 to 4095)
 // 
 void DAC_Out_NB(uint16_t code){
-    // Consider writing this (If it is what your heart desires)
-    // Consider the following registers:
-	  // SSI1_SR_R, SSI1_DR_R
+  SSI1_DR_R = TLV5616_CMD(code);
 }

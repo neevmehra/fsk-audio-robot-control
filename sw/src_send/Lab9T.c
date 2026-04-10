@@ -1,54 +1,36 @@
-// ----------------------------------------------------------------------------
-// 
-// File name:     Lab9.c
+// Lab9T.c
+// Lab 9 — Audio Communication Transmitter main
+// ECE445L Spring 2025
 //
-// ----------------------------------------------------------------------------
+// This board has: joystick (PE4/PE5), TLV5616 DAC (PD0/PD1/PD3),
+// LaunchPad switches (PF0/PF4) and LEDs (PF1–PF3).
 //
-// Description:   This lab is designed to be used on two devices
-//                This device is the transmitter with a joystick, DAC and speaker
-//                The other device is the RSLK robot
-// Author:        Your names
-// Orig gen date: August 4, 2024
-// Date:          Your date
-// Goal of this lab: Audio Communication of the robot
-//
-
-// ----------------------------------------------------------------------------
-// Hardware/software assigned to common
-// main initialization initializes all modules
-//   PD2, Timer5A, ADC1, UART0 implements TExaSdisplay
-// ----------------------------------------------------------------------------
-// Hardware/software assigned to transmitter
-//   UART0, possible source of input data (conflicts with TExaSdisplay)
-//   PC7-PC4 Port_C_Init, possible source of input data
-//   Timer0A periodic interrupt to generate input
-//   Fifo1 linkage from Input to Encoder
-//   Timer1A periodic interrupt create a sequence of frequencies
-//   Fifo2 linkage from  Encoder to DAC
-//   SSI1 PD3 PD1 PD0 TLV5616 DAC output
-//   SysTick ISR output to DAC
-// ----------------------------------------------------------------------------
-
+// The main loop only drives the LED colour to show the current command.
+// All real work happens in:
+//   SysTick_Handler @ 8 kHz  — DAC output
+//   Timer0A_Handler @ 50 Hz  — joystick + button read
 
 #include <stdint.h>
 #include "../inc/tm4c123gh6pm.h"
-#include "../inc/Texas.h"
 #include "../inc/PLL.h"
-#include "../inc/ST7735.h"
+#include "../inc/LaunchPad.h"
+#include "../inc/CortexM.h"
 #include "Transmitter.h"
-#include "../inc/dsp.h"
 
-
-void DisableInterrupts(void);           // Disable interrupts
-void EnableInterrupts(void);            // Enable interrupts
 int main(void){
   DisableInterrupts();
-  PLL_Init(Bus80MHz);    // bus clock at 80 MHz
-  // write this
+  PLL_Init(Bus80MHz);       // 80 MHz system clock
+  Transmitter_Init();       // set up DAC, ADC, timers
   EnableInterrupts();
+
   while(1){
-      // write this
+    // Mirror current command on the RGB LED for visual debugging
+    switch(Transmitter_GetCommand()){
+      case CMD_FORWARD:  LaunchPad_Output(GREEN);  break;
+      case CMD_LEFT:     LaunchPad_Output(BLUE);   break;
+      case CMD_RIGHT:    LaunchPad_Output(RED);    break;
+      case CMD_BACKWARD: LaunchPad_Output(YELLOW); break;
+      default:           LaunchPad_Output(DARK);   break;
+    }
   }
 }
-
-

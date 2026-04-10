@@ -47,6 +47,7 @@ void DAC_Init(uint16_t data);
 // outputs: none
 //
 void DAC_Out(uint16_t code);
+void DAC_Out_NB(uint16_t code);
 
    // -----------------   DAC_OutNonBlocking      --------------------------------
 //
