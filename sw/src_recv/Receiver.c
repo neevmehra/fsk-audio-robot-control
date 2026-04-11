@@ -1,38 +1,29 @@
 // Receiver.c
-// Lab 9 — Audio Communication Receiver
+// Lab 9 — Audio Communication Receiver (UART-FSK decoder)
 // ECE445L Spring 2025
 //
-// Architecture:
+// Encoding matches Transmitter.c exactly:
+//   f1 = 500 Hz  = mark  (logic 1)   — detected via DFT bin k=1
+//   f2 = 1000 Hz = space (logic 0)   — detected via DFT bin k=2
+//   UART 8N1 @ 100 baud (10 ms/bit)
+//   Frame: start(f2) + 8 data bits LSB-first + stop(f1)
 //
-//   Timer2A  @ 8 kHz  — SampleTask:
-//     Triggers ADC0 SS3, reads AIN8/PE5 (microphone), subtracts DC bias,
-//     pushes the signed sample into SampleFifo.
+// Timing:
+//   Timer2A ISR @ 8 kHz  → feeds samples into SampleFifo
+//   Main loop DFT: every 16 samples = 2 ms → one frequency decision
+//   WINDOWS_PER_BIT = 5  (10 ms / 2 ms)
 //
-//   Main loop  — Receiver_Run:
-//     Drains SampleFifo, feeds a 16-point DFT, computes magnitudes at
-//     f1 = 500 Hz (k = 1) and f2 = 1000 Hz (k = 2) every 16 samples,
-//     decodes the command, and drives the RSLK motors.
-//
-// Decoding:
-//   Mag1 only  → LEFT
-//   Mag2 only  → RIGHT
-//   Both       → FORWARD
-//   Alternating LEFT/RIGHT (transmitter toggles 100 ms each) → BACKWARD
-//   Neither    → STOP
-//
-// Threshold:
-//   RX_MAG_THRESHOLD = 5000
-//   Requires signal amplitude ≥ ~9 ADC counts at PE5.
-//   Increase this value if the robot reacts to background noise;
-//   decrease it if it fails to react when sound is played nearby.
+// UART decoder state machine (runs in Receiver_Run):
+//   IDLE  → waits for first f2 (start-bit edge)
+//   SYNC  → waits 2 more DFT windows to centre on start bit, verifies f2
+//   DATA  → samples 8 data bits, one per WINDOWS_PER_BIT DFT windows
+//   STOP  → verifies stop bit (f1), then outputs decoded command
 //
 // Hardware:
-//   Microphone (MAX4466 + electret) → AIN8 / PE5  (ADC0 SS3)
-//   Motors     → RSLK2 (Motor.c: PF2/PF3 PWM, PA2/PA3 direction)
-//   Bumpers    → Bump.c (PA5, PF0, PB3, PC4)
-//   LEDs       → LaunchPad PF1–PF3
-//   Display    → SSD1306 I2C OLED (PA6 = SCL, PA7 = SDA)
-//                MUST be connected — I2C will hang if absent.
+//   Microphone (MAX4466) → AIN8 / PE5  (ADC0 SS3)
+//   Motors    → RSLK2 (Motor.c)
+//   Bump switches → Bump.c
+//   SSD1306 I2C OLED → PA6/PA7  (MUST be connected)
 
 #include <stdint.h>
 #include <stdio.h>
@@ -46,118 +37,85 @@
 #include "../inc/Timer2A.h"
 #include "Receiver.h"
 
-// ─── Sample FIFO (64 × int32_t; producer = Timer2A ISR, consumer = main) ─────
+// ─── Sample FIFO (64 × int32_t) ──────────────────────────────────────────────
 AddIndexFifo(Sample, 64, int32_t, 1, 0)
 
-// ─── Tuning constants ─────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 #define RX_SAMPLE_PERIOD   10000u   // Timer2A reload: 80 MHz / 8 kHz
-#define RX_DFT_LEN            16u   // DFT window (one result every 2 ms)
-#define RX_MAG_THRESHOLD    5000u   // min Mag² to count as "tone present"
-                                    // raise if false triggers; lower if misses
-#define RX_ACTION_HOLD        50u   // DFT periods to hold command after last hit
-                                    // 50 × 2 ms = 100 ms coasting
-#define RX_MOTOR_DUTY      14000u   // PWM duty (range 2 .. 39998)
+#define RX_DFT_LEN            16u   // DFT window → one decision every 2 ms
+#define RX_MAG_THRESHOLD    5000u   // min Mag² to count tone as present
+#define RX_MOTOR_DUTY      14000u   // PWM duty (2 .. 39998)
+
+// UART timing: 10 ms/bit = 5 DFT windows per bit
+#define WINDOWS_PER_BIT        5u
+#define SYNC_WAIT              2u   // DFT windows to wait after start-edge
+                                    // → samples near bit centre
+
+// ─── UART decoder states ──────────────────────────────────────────────────────
+#define STATE_IDLE   0
+#define STATE_SYNC   1
+#define STATE_DATA   2
+#define STATE_STOP   3
 
 // ─── Module state ─────────────────────────────────────────────────────────────
-static volatile uint8_t  CurrentCommand   = RX_CMD_STOP;
-static volatile uint32_t LastMag1         = 0;
-static volatile uint32_t LastMag2         = 0;
-static volatile uint32_t ActionHold       = 0;
+static volatile uint8_t  CurrentCommand = RX_CMD_STOP;
+static volatile uint32_t LastMag1       = 0;
+static volatile uint32_t LastMag2       = 0;
 
-static uint32_t DftIndex         = 0;
-static uint8_t  RawPrevious      = RX_CMD_STOP;
-static uint8_t  AlternatingCount = 0;
-static uint32_t DisplayDivider   = 0;
+static uint32_t DftIndex       = 0;
+static uint32_t DisplayDivider = 0;
 
-// ─── ADC initialisation (PE5 / AIN8, software-trigger, SS3) ─────────────────
+// UART decoder
+static uint8_t  UartState   = STATE_IDLE;
+static uint8_t  UartTimer   = 0;    // countdown within current state
+static uint8_t  UartBitCnt  = 0;    // data bits collected so far
+static uint8_t  UartRxByte  = 0;    // byte being assembled
+
+// ─── ADC (AIN8/PE5, software-trigger, SS3) ───────────────────────────────────
 static void ReceiverADC_Init(void){
   volatile uint32_t delay;
-
-  SYSCTL_RCGCADC_R  |= 0x01u;   // enable ADC0 run-mode clock
-  SYSCTL_RCGCGPIO_R |= 0x10u;   // enable Port E run-mode clock
-  delay = SYSCTL_RCGCGPIO_R;    // let clock stabilise (two dummy reads)
+  SYSCTL_RCGCADC_R  |= 0x01u;
+  SYSCTL_RCGCGPIO_R |= 0x10u;
+  delay = SYSCTL_RCGCGPIO_R;
   delay = SYSCTL_RCGCGPIO_R;
   (void)delay;
-  while((SYSCTL_PRADC_R  & 0x01u) == 0u){};  // wait ADC0 peripheral ready
-  while((SYSCTL_PRGPIO_R & 0x10u) == 0u){};  // wait Port E peripheral ready
+  while((SYSCTL_PRADC_R  & 0x01u) == 0u){};
+  while((SYSCTL_PRGPIO_R & 0x10u) == 0u){};
 
-  // Configure PE5 as analog input (AIN8)
-  GPIO_PORTE_DIR_R   &= ~0x20u;  // PE5 input
-  GPIO_PORTE_AFSEL_R |=  0x20u;  // alternate function (ADC)
-  GPIO_PORTE_DEN_R   &= ~0x20u;  // disable digital buffer
-  GPIO_PORTE_AMSEL_R |=  0x20u;  // enable analog mode
+  GPIO_PORTE_DIR_R   &= ~0x20u;
+  GPIO_PORTE_AFSEL_R |=  0x20u;
+  GPIO_PORTE_DEN_R   &= ~0x20u;
+  GPIO_PORTE_AMSEL_R |=  0x20u;
 
-  // ADC0 SS3: software-trigger, single-sample (AIN8), 125 kSPS max
-  ADC0_PC_R     = (ADC0_PC_R & ~0x0Fu) | 0x01u;  // 125 kSPS
-  ADC0_SSPRI_R  = 0x3210u;                         // SS3 = lowest priority
-  ADC0_ACTSS_R &= ~0x08u;                          // disable SS3 during config
-  ADC0_EMUX_R  &= ~0xF000u;                        // SS3 trigger = software
-  ADC0_SSMUX3_R = 8u;                              // select AIN8 (PE5)
-  ADC0_SSCTL3_R = 0x0006u;                         // IE0=1, END0=1
-  ADC0_IM_R    &= ~0x08u;                          // no NVIC interrupt (we busy-wait)
-  ADC0_ACTSS_R |=  0x08u;                          // enable SS3
+  ADC0_PC_R     = (ADC0_PC_R & ~0x0Fu) | 0x01u;
+  ADC0_SSPRI_R  = 0x3210u;
+  ADC0_ACTSS_R &= ~0x08u;
+  ADC0_EMUX_R  &= ~0xF000u;
+  ADC0_SSMUX3_R = 8u;
+  ADC0_SSCTL3_R = 0x0006u;
+  ADC0_IM_R    &= ~0x08u;
+  ADC0_ACTSS_R |=  0x08u;
 }
 
-// Software-trigger ADC0 SS3, busy-wait for result, return signed 12-bit value.
-// Called from Timer2A ISR — conversion takes ~3 µs at 125 kSPS (2.4% ISR load).
 static int32_t ReceiverADC_In(void){
   ADC0_PSSI_R = 0x08u;
   while((ADC0_RIS_R & 0x08u) == 0u){};
   int32_t s = (int32_t)(ADC0_SSFIFO3_R & 0x0FFFu);
-  ADC0_ISC_R  = 0x08u;   // clear raw interrupt flag
+  ADC0_ISC_R  = 0x08u;
   return s;
 }
 
 // ─── Timer2A ISR @ 8 kHz ─────────────────────────────────────────────────────
 static void SampleTask(void){
-  int32_t s = ReceiverADC_In() - 2048;   // subtract DC midpoint
+  int32_t s = ReceiverADC_In() - 2048;
   SampleFifo_Put(s);
-}
-
-// ─── Decode magnitudes → raw command ─────────────────────────────────────────
-// f1 (Mag1 @ 500 Hz) and f2 (Mag2 @ 1000 Hz) are orthogonal DFT bins,
-// so they are independent: detecting one does NOT leak into the other.
-static uint8_t DecodeFromMagnitudes(uint32_t m1, uint32_t m2){
-  uint8_t has1 = (m1 > RX_MAG_THRESHOLD);
-  uint8_t has2 = (m2 > RX_MAG_THRESHOLD);
-
-  if(has1 && has2){ return RX_CMD_FORWARD; }
-  if(has1)        { return RX_CMD_LEFT;    }
-  if(has2)        { return RX_CMD_RIGHT;   }
-  return RX_CMD_STOP;
-}
-
-// ─── Backward detection ───────────────────────────────────────────────────────
-// The transmitter encodes BACKWARD as alternating LEFT/RIGHT tones (100 ms each).
-// We count command *transitions* — not every DFT call — so that 50 consecutive
-// LEFT results (during one 100 ms half-period) count as a single event.
-static uint8_t ApplyBackwardDetection(uint8_t raw){
-  if(raw == RawPrevious){
-    // Command unchanged — hold the existing count; no update needed.
-    return (AlternatingCount >= 3u) ? RX_CMD_BACKWARD : raw;
-  }
-
-  // Command has changed — update alternation counter.
-  if(((raw == RX_CMD_LEFT)  && (RawPrevious == RX_CMD_RIGHT)) ||
-     ((raw == RX_CMD_RIGHT) && (RawPrevious == RX_CMD_LEFT))){
-    // Strict LEFT↔RIGHT alternation: count it.
-    if(AlternatingCount < 255u){ AlternatingCount++; }
-  } else {
-    // Any other transition (e.g. STOP, FORWARD) resets the counter.
-    AlternatingCount = 0;
-  }
-  RawPrevious = raw;
-
-  return (AlternatingCount >= 3u) ? RX_CMD_BACKWARD : raw;
 }
 
 // ─── Motor + LED output ───────────────────────────────────────────────────────
 static void ApplyRobotCommand(uint8_t cmd){
   if(Bump_In()){
-    // Any bump switch → emergency stop
     Motor_Forward(0, 0);
     LaunchPad_Output(DARK);
-    ActionHold = 0;
     return;
   }
   switch(cmd){
@@ -177,14 +135,14 @@ static void ApplyRobotCommand(uint8_t cmd){
       Motor_Backward(RX_MOTOR_DUTY, RX_MOTOR_DUTY);
       LaunchPad_Output(YELLOW);
       break;
-    default:               // RX_CMD_STOP
+    default:
       Motor_Forward(0, 0);
       LaunchPad_Output(DARK);
       break;
   }
 }
 
-// ─── OLED display (updated every ~128 ms) ────────────────────────────────────
+// ─── OLED display (every ~128 ms) ────────────────────────────────────────────
 static void UpdateDisplay(void){
   char line[22];
   static const char *const CmdName[5] = {
@@ -205,61 +163,123 @@ static void UpdateDisplay(void){
   SSD1306_OutString(line);
 
   SSD1306_SetCursor(0, 5);
-  snprintf(line, sizeof(line), "Bump:%d Hold:%2lu",
-           (int)Bump_In(), (unsigned long)ActionHold);
+  snprintf(line, sizeof(line), "St:%d Rx:0x%02X",
+           (int)UartState, (unsigned int)CurrentCommand);
   SSD1306_OutString(line);
+}
+
+// ─── UART-FSK decoder (called every DFT window = every 2 ms) ─────────────────
+// has1 = f1 detected (mark),  has2 = f2 detected (space)
+static void UartDecode(uint8_t has1, uint8_t has2){
+  switch(UartState){
+
+    // ── IDLE: looking for start-bit edge (mark→space transition) ─────────────
+    case STATE_IDLE:
+      if(has2 && !has1){
+        // f2 detected = start bit beginning
+        UartTimer  = SYNC_WAIT;   // wait 2 more windows to centre on start bit
+        UartState  = STATE_SYNC;
+      }
+      break;
+
+    // ── SYNC: verify start bit is still present after centering ──────────────
+    case STATE_SYNC:
+      UartTimer--;
+      if(UartTimer == 0){
+        if(has2){
+          // Valid start bit confirmed — prepare to receive 8 data bits
+          UartRxByte = 0;
+          UartBitCnt = 0;
+          UartTimer  = WINDOWS_PER_BIT;
+          UartState  = STATE_DATA;
+        } else {
+          UartState = STATE_IDLE;   // false start, go back
+        }
+      }
+      break;
+
+    // ── DATA: sample one bit per WINDOWS_PER_BIT windows ────────────────────
+    case STATE_DATA:
+      UartTimer--;
+      if(UartTimer == 0){
+        // Sample this bit: f1=mark=1, anything else=0
+        if(has1){
+          UartRxByte |= (uint8_t)(1u << UartBitCnt);
+        }
+        UartBitCnt++;
+        UartTimer = WINDOWS_PER_BIT;
+        if(UartBitCnt == 8u){
+          UartState = STATE_STOP;
+        }
+      }
+      break;
+
+    // ── STOP: verify stop bit (f1 = mark) ────────────────────────────────────
+    case STATE_STOP:
+      UartTimer--;
+      if(UartTimer == 0){
+        if(has1){
+          // Valid frame — apply command if value is in range
+          if(UartRxByte <= RX_CMD_BACKWARD){
+            CurrentCommand = UartRxByte;
+          }
+        }
+        // Always return to IDLE regardless of stop-bit validity
+        UartState = STATE_IDLE;
+      }
+      break;
+
+    default:
+      UartState = STATE_IDLE;
+      break;
+  }
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 void Receiver_Init(void){
-  LaunchPad_Init();                          // PF LEDs + buttons
-  Bump_Init();                               // bump switches
-  Motor_Init();                              // RSLK PWM + direction pins
-  SSD1306_Init(SSD1306_SWITCHCAPVCC);        // I2C OLED (PA6/PA7)
+  LaunchPad_Init();
+  Bump_Init();
+  Motor_Init();
+  SSD1306_Init(SSD1306_SWITCHCAPVCC);
   SSD1306_OutClear();
 
   SampleFifo_Init();
   DFT_Init();
-  ReceiverADC_Init();                        // ADC0 SS3 on AIN8/PE5
+  ReceiverADC_Init();
 
-  CurrentCommand   = RX_CMD_STOP;
-  LastMag1         = 0;
-  LastMag2         = 0;
-  ActionHold       = 0;
-  DftIndex         = 0;
-  RawPrevious      = RX_CMD_STOP;
-  AlternatingCount = 0;
-  DisplayDivider   = 0;
+  CurrentCommand = RX_CMD_STOP;
+  LastMag1       = 0;
+  LastMag2       = 0;
+  DftIndex       = 0;
+  DisplayDivider = 0;
+  UartState      = STATE_IDLE;
+  UartTimer      = 0;
+  UartBitCnt     = 0;
+  UartRxByte     = 0;
 
-  Timer2A_Init(&SampleTask, RX_SAMPLE_PERIOD, 1);  // 8 kHz, priority 1
+  Timer2A_Init(&SampleTask, RX_SAMPLE_PERIOD, 1);   // 8 kHz, priority 1
 }
 
 void Receiver_Run(void){
   int32_t sample;
   while(SampleFifo_Get(&sample)){
-    // Feed one sample into the running 16-point DFT
     DFT(DftIndex & 0x0Fu, sample);
     DftIndex++;
 
-    // Every 16 samples (every 2 ms) compute magnitudes and act
     if((DftIndex & (RX_DFT_LEN - 1u)) == 0u){
-      uint8_t raw;
+      uint8_t has1, has2;
 
-      LastMag1 = (uint32_t)Mag1();   // magnitude² at f1 = 500 Hz; clears accumulators
-      LastMag2 = (uint32_t)Mag2();   // magnitude² at f2 = 1000 Hz
+      LastMag1 = (uint32_t)Mag1();   // mag² at f1 = 500 Hz
+      LastMag2 = (uint32_t)Mag2();   // mag² at f2 = 1000 Hz
 
-      raw            = DecodeFromMagnitudes(LastMag1, LastMag2);
-      CurrentCommand = ApplyBackwardDetection(raw);
+      has1 = (LastMag1 > RX_MAG_THRESHOLD);
+      has2 = (LastMag2 > RX_MAG_THRESHOLD);
 
-      // Refresh action-hold timer
-      if(CurrentCommand != RX_CMD_STOP){
-        ActionHold = RX_ACTION_HOLD;
-      } else if(ActionHold > 0u){
-        ActionHold--;
-      }
+      // Feed frequency detection into UART decoder
+      UartDecode(has1, has2);
 
-      // Drive motors (stop if hold expired)
-      ApplyRobotCommand(ActionHold ? CurrentCommand : RX_CMD_STOP);
+      // Drive motors with latest decoded command
+      ApplyRobotCommand(CurrentCommand);
 
       // Refresh OLED every 64 DFT periods (≈ 128 ms)
       DisplayDivider++;
@@ -272,4 +292,4 @@ void Receiver_Run(void){
 
 uint8_t  Receiver_GetCommand(void){ return CurrentCommand; }
 uint32_t Receiver_GetMag1(void)   { return LastMag1;       }
-uint32_t Receiver_GetMag2(void)   { return LastMag2;       }
+uint32_t Receiver_GetMag2(void)   { return LastMag2        ;}
