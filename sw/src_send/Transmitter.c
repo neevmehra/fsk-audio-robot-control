@@ -29,8 +29,13 @@
 #include "../inc/TLV5616.h"
 #include "../inc/LaunchPad.h"
 #include "Joystick.h"
+#include "CommandFifo.h"
 #include "Transmitter.h"
 
+// ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
+// round(1800 * sin(k * 2*pi / 64)) for k = 0..63
+// ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
+// round(1800 * sin(k * 2*pi / 64)) for k = 0..63
 // ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
 // round(1800 * sin(k * 2*pi / 64)) for k = 0..63
 static const int16_t Sine64[64] = {
@@ -50,7 +55,7 @@ static const int16_t Sine64[64] = {
 
 // UART baud: 100 baud → 80 SysTick calls per bit = 10 ms
 #define BIT_PERIOD    80u
-#define FRAME_BITS    10u       // start(1) + data(8) + stop(1)
+#define FRAME_BITS    11u
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 static volatile uint8_t  CurrentCommand = CMD_STOP;
@@ -67,6 +72,15 @@ static volatile uint8_t  TxFrame    = CMD_STOP;     // byte being transmitted
 // ─── Joystick calibration ─────────────────────────────────────────────────────
 static uint32_t CalCenterX = JOY_CENTER;
 static uint32_t CalCenterY = JOY_CENTER;
+
+static uint8_t LastQueuedCmd = CMD_STOP;
+
+static uint8_t EvenParity8(uint8_t b){
+  b ^= b >> 4;
+  b ^= b >> 2;
+  b ^= b >> 1;
+  return b & 1u;
+}
 
 static void CalibrateJoystick(void){
   uint32_t joy[2], sumX = 0, sumY = 0;
@@ -87,19 +101,37 @@ static uint8_t ReadCommand(void){
   JoyStick_In(joy);
   sw = JoyStick_Button();
 
-  if(sw & 0x02u){ return CMD_STOP; }   // SW1/PF4 = hard stop
+  if(sw & 0x02u){
+    return CMD_STOP;
+  }
 
-  if((int32_t)joy[0] > (int32_t)CalCenterY + (int32_t)JOY_DEAD){ return CMD_FORWARD;  }
-  if((int32_t)joy[0] < (int32_t)CalCenterY - (int32_t)JOY_DEAD){ return CMD_BACKWARD; }
-  if((int32_t)joy[1] > (int32_t)CalCenterX + (int32_t)JOY_DEAD){ return CMD_RIGHT;    }
-  if((int32_t)joy[1] < (int32_t)CalCenterX - (int32_t)JOY_DEAD){ return CMD_LEFT;     }
+  if((int32_t)joy[0] > (int32_t)CalCenterY + (int32_t)JOY_DEAD){
+    return CMD_FORWARD;
+  }
+  if((int32_t)joy[0] < (int32_t)CalCenterY - (int32_t)JOY_DEAD){
+    return CMD_BACKWARD;
+  }
+  if((int32_t)joy[1] > (int32_t)CalCenterX + (int32_t)JOY_DEAD){
+    return CMD_RIGHT;
+  }
+  if((int32_t)joy[1] < (int32_t)CalCenterX - (int32_t)JOY_DEAD){
+    return CMD_LEFT;
+  }
 
-  if(sw & 0x01u){ return CMD_BACKWARD; }  // SW2/PF0 = backward
+  if(sw & 0x01u){
+    return CMD_BACKWARD;
+  }
   return CMD_STOP;
 }
 
 static void InputTask(void){
-  CurrentCommand = ReadCommand();
+  uint8_t c = ReadCommand();
+  CurrentCommand = c;
+  if(c != LastQueuedCmd){
+    if(CommandFifo_Put(c)){
+      LastQueuedCmd = c;
+    }
+  }
   InputSamples++;
 }
 
@@ -117,34 +149,40 @@ void SysTick_Handler(void){
   if(TxBitIdx == 0){
     mark = 0u;                                   // start bit = space
   } else if(TxBitIdx <= 8u){
-    mark = (TxFrame >> (TxBitIdx - 1u)) & 1u;   // data bit, LSB first
+    mark = (uint8_t)((TxFrame >> (TxBitIdx - 1u)) & 1u);
+  } else if(TxBitIdx == 9u){
+    mark = EvenParity8(TxFrame);
   } else {
     mark = 1u;                                   // stop bit = mark
   }
 
-  // Generate tone for this sample
   if(mark){
-    Phase1 = (Phase1 + INC_F1) & 0x3Fu;
+    Phase1 = (uint8_t)((Phase1 + INC_F1) & 0x3Fu);
     sample += Sine64[Phase1] / 2;
   } else {
-    Phase2 = (Phase2 + INC_F2) & 0x3Fu;
+    Phase2 = (uint8_t)((Phase2 + INC_F2) & 0x3Fu);
     sample += Sine64[Phase2] / 2;
   }
 
-  // Advance bit-period timer
   TxBitTimer--;
-  if(TxBitTimer == 0){
+  if(TxBitTimer == 0u){
     TxBitTimer = BIT_PERIOD;
     TxBitIdx++;
     if(TxBitIdx >= FRAME_BITS){
-      // End of frame — reload command and restart immediately
-      TxFrame    = CurrentCommand;
-      TxBitIdx   = 0;
+      uint8_t next = CMD_STOP;
+      if(!CommandFifo_Get(&next)){
+        next = CurrentCommand;
+      }
+      TxFrame  = next;
+      TxBitIdx = 0;
     }
   }
 
-  if(sample < 0)         sample = 0;
-  else if(sample > 4095) sample = 4095;
+  if(sample < 0){
+    sample = 0;
+  } else if(sample > 4095){
+    sample = 4095;
+  }
 
   DAC_Out_NB((uint16_t)sample);
   WaveSamples++;
@@ -152,7 +190,11 @@ void SysTick_Handler(void){
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 void Transmitter_Init(void){
-  JoyStick_Init();          // ADC0 SS2 on PE4/PE5, LaunchPad buttons on PF
+  JoyStick_Init();
+
+  CommandFifo_Init();
+  LastQueuedCmd = CMD_STOP;
+  CommandFifo_Put(CMD_STOP);
 
   CurrentCommand = CMD_STOP;
   Phase1 = Phase2 = 0;
@@ -164,8 +206,8 @@ void Transmitter_Init(void){
   // Measure actual joystick resting position — don't touch stick during boot
   CalibrateJoystick();
 
-  DAC_Init(SINE_MID);                           // TLV5616 via SSI1 (PD0/PD1/PD3)
-  Timer0A_Init(&InputTask, TIMER0A_50HZ, 3);    // 50 Hz, priority 3
+  DAC_Init(SINE_MID);
+  Timer0A_Init(&InputTask, TIMER0A_50HZ, 3);
 
   // SysTick @ 8 kHz, priority 1 (higher than Timer0A)
   NVIC_ST_CTRL_R    = 0;

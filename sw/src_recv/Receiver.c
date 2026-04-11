@@ -2,11 +2,11 @@
 // Lab 9 — Audio Communication Receiver (UART-FSK decoder)
 // ECE445L Spring 2025
 //
-// Encoding matches Transmitter.c exactly:
-//   f1 = 500 Hz  = mark  (logic 1)   — detected via DFT bin k=1
-//   f2 = 1000 Hz = space (logic 0)   — detected via DFT bin k=2
-//   UART 8N1 @ 100 baud (10 ms/bit)
-//   Frame: start(f2) + 8 data bits LSB-first + stop(f1)
+// Encoding matches Transmitter.c:
+//   f1 = 500 Hz  = mark  (logic 1)   — DFT bin k=1
+//   f2 = 1000 Hz = space (logic 0)   — DFT bin k=2
+//   100 baud (10 ms/bit)
+//   Frame: start(f2) + 8 data LSB-first + even parity + stop(f1)
 //
 // Timing:
 //   Timer2A ISR @ 8 kHz  → feeds samples into SampleFifo
@@ -16,8 +16,8 @@
 // UART decoder state machine (runs in Receiver_Run):
 //   IDLE  → waits for first f2 (start-bit edge)
 //   SYNC  → waits 2 more DFT windows to centre on start bit, verifies f2
-//   DATA  → samples 8 data bits, one per WINDOWS_PER_BIT DFT windows
-//   STOP  → verifies stop bit (f1), then outputs decoded command
+//   DATA  → samples 8 data bits, then one parity bit
+//   STOP  → verifies stop bit (f1) + even parity, then outputs command
 //
 // Hardware:
 //   Microphone (MAX4466) → AIN8 / PE5  (ADC0 SS3)
@@ -43,7 +43,10 @@ AddIndexFifo(Sample, 64, int32_t, 1, 0)
 // ─── Constants ───────────────────────────────────────────────────────────────
 #define RX_SAMPLE_PERIOD   10000u   // Timer2A reload: 80 MHz / 8 kHz
 #define RX_DFT_LEN            16u   // DFT window → one decision every 2 ms
-#define RX_MAG_THRESHOLD    5000u   // min Mag² to count tone as present
+#define RX_MAG_THRESHOLD    8000u   // min Mag² to count tone as present (raise if false starts)
+// Space (1000 Hz) must exceed mark (500 Hz) by this much to begin a frame — rejects broadband noise
+#define RX_SPACE_OVER_MARK  6000u
+#define RX_STARTUP_TICKS    300u    // ~600 ms @ 2 ms/decode; motors stay stopped while ADC/DFT settle
 #define RX_MOTOR_DUTY      14000u   // PWM duty (2 .. 39998)
 
 // UART timing: 10 ms/bit = 5 DFT windows per bit
@@ -70,6 +73,8 @@ static uint8_t  UartState   = STATE_IDLE;
 static uint8_t  UartTimer   = 0;    // countdown within current state
 static uint8_t  UartBitCnt  = 0;    // data bits collected so far
 static uint8_t  UartRxByte  = 0;    // byte being assembled
+static uint8_t  UartParityRx = 0;   // received parity bit (0/1)
+static uint32_t RxDecodeTicks = 0; // DFT decode calls since init (for startup mute)
 
 // ─── ADC (AIN8/PE5, software-trigger, SS3) ───────────────────────────────────
 static void ReceiverADC_Init(void){
@@ -169,15 +174,14 @@ static void UpdateDisplay(void){
 }
 
 // ─── UART-FSK decoder (called every DFT window = every 2 ms) ─────────────────
-// has1 = f1 detected (mark),  has2 = f2 detected (space)
-static void UartDecode(uint8_t has1, uint8_t has2){
+// has1/has2: quick thresholds; mag1/mag2: raw Mag² — use dominance to avoid noise false starts
+static void UartDecode(uint8_t has1, uint8_t has2, uint32_t mag1, uint32_t mag2){
   switch(UartState){
 
-    // ── IDLE: looking for start-bit edge (mark→space transition) ─────────────
+    // ── IDLE: real start bit = strong 1000 Hz and clearly stronger than 500 Hz bin ──
     case STATE_IDLE:
-      if(has2 && !has1){
-        // f2 detected = start bit beginning
-        UartTimer  = SYNC_WAIT;   // wait 2 more windows to centre on start bit
+      if((mag2 > RX_MAG_THRESHOLD) && (mag2 > mag1 + RX_SPACE_OVER_MARK)){
+        UartTimer  = SYNC_WAIT;
         UartState  = STATE_SYNC;
       }
       break;
@@ -198,33 +202,41 @@ static void UartDecode(uint8_t has1, uint8_t has2){
       }
       break;
 
-    // ── DATA: sample one bit per WINDOWS_PER_BIT windows ────────────────────
+    // ── DATA: 8 data bits then parity bit ───────────────────────────────────
     case STATE_DATA:
       UartTimer--;
       if(UartTimer == 0){
-        // Sample this bit: f1=mark=1, anything else=0
-        if(has1){
-          UartRxByte |= (uint8_t)(1u << UartBitCnt);
-        }
-        UartBitCnt++;
-        UartTimer = WINDOWS_PER_BIT;
-        if(UartBitCnt == 8u){
-          UartState = STATE_STOP;
+        if(UartBitCnt < 8u){
+          if(has1){
+            UartRxByte |= (uint8_t)(1u << UartBitCnt);
+          }
+          UartBitCnt++;
+          UartTimer = WINDOWS_PER_BIT;
+        } else if(UartBitCnt == 8u){
+          UartParityRx = has1 ? 1u : 0u;
+          UartBitCnt   = 9u;
+          UartTimer    = WINDOWS_PER_BIT;
+          UartState    = STATE_STOP;
         }
       }
       break;
 
-    // ── STOP: verify stop bit (f1 = mark) ────────────────────────────────────
+    // ── STOP: verify stop bit (f1) + even parity ─────────────────────────────
     case STATE_STOP:
       UartTimer--;
       if(UartTimer == 0){
         if(has1){
-          // Valid frame — apply command if value is in range
-          if(UartRxByte <= RX_CMD_BACKWARD){
-            CurrentCommand = UartRxByte;
+          uint8_t x = UartRxByte;
+          x ^= x >> 4;
+          x ^= x >> 2;
+          x ^= x >> 1;
+          uint8_t wantP = x & 1u;
+          if((wantP ^ (UartParityRx & 1u)) == 0u){
+            if(UartRxByte <= RX_CMD_BACKWARD){
+              CurrentCommand = UartRxByte;
+            }
           }
         }
-        // Always return to IDLE regardless of stop-bit validity
         UartState = STATE_IDLE;
       }
       break;
@@ -256,6 +268,8 @@ void Receiver_Init(void){
   UartTimer      = 0;
   UartBitCnt     = 0;
   UartRxByte     = 0;
+  UartParityRx   = 0;
+  RxDecodeTicks  = 0;
 
   Timer2A_Init(&SampleTask, RX_SAMPLE_PERIOD, 1);   // 8 kHz, priority 1
 }
@@ -275,11 +289,15 @@ void Receiver_Run(void){
       has1 = (LastMag1 > RX_MAG_THRESHOLD);
       has2 = (LastMag2 > RX_MAG_THRESHOLD);
 
-      // Feed frequency detection into UART decoder
-      UartDecode(has1, has2);
+      RxDecodeTicks++;
 
-      // Drive motors with latest decoded command
-      ApplyRobotCommand(CurrentCommand);
+      UartDecode(has1, has2, LastMag1, LastMag2);
+
+      if(RxDecodeTicks < RX_STARTUP_TICKS){
+        ApplyRobotCommand(RX_CMD_STOP);
+      } else {
+        ApplyRobotCommand(CurrentCommand);
+      }
 
       // Refresh OLED every 64 DFT periods (≈ 128 ms)
       DisplayDivider++;

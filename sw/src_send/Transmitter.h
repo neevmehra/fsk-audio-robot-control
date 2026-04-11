@@ -6,12 +6,12 @@
 #define __TRANSMITTER_H__
 #include <stdint.h>
 
-// ── Command codes ─────────────────────────────────────────────────────────────
-#define CMD_STOP     0   // silence
-#define CMD_FORWARD  1   // f1 + f2 mixed
-#define CMD_LEFT     2   // f1 only  (500 Hz)
-#define CMD_RIGHT    3   // f2 only  (1000 Hz)
-#define CMD_BACKWARD 4   // f1 and f2 alternating every 100 ms
+// ── Command codes (must match Receiver.h RX_CMD_*) ────────────────────────────
+#define CMD_STOP     0u
+#define CMD_FORWARD  1u
+#define CMD_LEFT     2u
+#define CMD_RIGHT    3u
+#define CMD_BACKWARD 4u
 
 // ── Tone frequencies ──────────────────────────────────────────────────────────
 // Sample rate fs = 8000 Hz, 64-point sine table
@@ -28,7 +28,7 @@
 
 // Transmitter_Init
 // Initialises all transmitter peripherals:
-//   Joystick:  ADC0 SS2 on AIN8/PE5 (X) and AIN9/PE4 (Y)
+//   Joystick:  ADC0 SS2 — data[0]=AIN8/PE5 (Y), data[1]=AIN9/PE4 (X)
 //   Buttons:   LaunchPad PF0 (SW2) and PF4 (SW1)
 //   DAC:       TLV5616 via SSI1 on PD0/PD1/PD3
 //   Timer0A:   50 Hz  → InputTask  (reads joystick → updates CurrentCommand)
