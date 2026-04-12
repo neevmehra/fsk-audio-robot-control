@@ -49,6 +49,8 @@ static const uint8_t TxInc[5] = { 4u, 8u, 12u, 16u, 20u };
 static volatile uint8_t  CurrentCommand = CMD_STOP;
 static volatile uint32_t WaveSamples    = 0;
 static volatile uint32_t InputSamples   = 0;
+static volatile int32_t  LastDX         = 0;  // signed X displacement from calibrated center
+static volatile int32_t  LastDY         = 0;  // signed Y displacement from calibrated center
 
 static volatile uint8_t TxPhase = 0;
 
@@ -100,6 +102,9 @@ static uint8_t ReadCommand(void){
 #if JOY_INVERT_Y
   dy = -dy;
 #endif
+
+  LastDX = dx;
+  LastDY = dy;
 
   adx = dx >= 0 ? dx : -dx;
   ady = dy >= 0 ? dy : -dy;
@@ -209,3 +214,7 @@ uint32_t Transmitter_GetInputSamples(void) { return InputSamples;   }
 uint32_t Transmitter_GetWaveSamples(void)  { return WaveSamples;    }
 uint16_t Transmitter_GetFiltX(void)        { return FiltX;          }
 uint16_t Transmitter_GetFiltY(void)        { return FiltY;          }
+int32_t  Transmitter_GetDX(void)           { return LastDX;         }
+int32_t  Transmitter_GetDY(void)           { return LastDY;         }
+uint32_t Transmitter_GetCalCX(void)        { return CalCenterX;     }
+uint32_t Transmitter_GetCalCY(void)        { return CalCenterY;     }

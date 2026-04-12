@@ -60,4 +60,13 @@ uint32_t Transmitter_GetWaveSamples(void);
 uint16_t Transmitter_GetFiltX(void);
 uint16_t Transmitter_GetFiltY(void);
 
+// Returns signed displacement from calibrated center (after SWAP/INVERT applied)
+// Positive dX = RIGHT candidate; positive dY = FORWARD candidate
+int32_t  Transmitter_GetDX(void);
+int32_t  Transmitter_GetDY(void);
+
+// Returns the calibrated center ADC values measured at boot
+uint32_t Transmitter_GetCalCX(void);
+uint32_t Transmitter_GetCalCY(void);
+
 #endif // __TRANSMITTER_H__
