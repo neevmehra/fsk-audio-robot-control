@@ -28,28 +28,38 @@
 #include <stdint.h>
 #include "../inc/tm4c123gh6pm.h"
 
-#define TLV5616_CMD(code) (0x1000 | ((code) & 0x0FFF))
+// Valvano/TI: 0x1000 sets speed/control nibble for normal update.
+// Lab 5 `dac_output` used `(code)&0x0FFF` only — if you still get silence after
+// DAC_Init fix, change this macro to: ((code) & 0x0FFFu)
+#define TLV5616_CMD(code) (0x1000u | ((uint16_t)(code) & 0x0FFFu))
 
 //----------------   DAC_Init     -------------------------------------------
 // Initialize TLV5616 12-bit DAC
 // assumes bus clock is 80 MHz
 // inputs: initial voltage output (0 to 4095)
 // outputs:none
+//
+// SSI timing matches EE445L Lab 5 working `dac_init` (sw/src/DAC.c): same CPSR,
+// CR0 extra bit, and PRGPIO wait — required for correct SPI edges on many boards.
 void DAC_Init(uint16_t data){
   volatile uint32_t delay;
   SYSCTL_RCGCSSI_R |= 0x02;      // activate SSI1
   SYSCTL_RCGCGPIO_R |= 0x08;     // activate Port D
+  while((SYSCTL_PRGPIO_R & 0x08) == 0){};
   delay = SYSCTL_RCGCGPIO_R;
   (void)delay;
 
-  GPIO_PORTD_AFSEL_R |= 0x0B;    // PD3,PD1,PD0 alternate function
+  GPIO_PORTD_AMSEL_R &= ~0x0B;   // disable analog on PD0, PD1, PD3
+  GPIO_PORTD_AFSEL_R |= 0x0B;    // PD3, PD1, PD0 alternate function
   GPIO_PORTD_DEN_R |= 0x0B;      // digital enable
-  GPIO_PORTD_AMSEL_R &= ~0x0B;   // disable analog
-  GPIO_PORTD_PCTL_R = (GPIO_PORTD_PCTL_R&0xFFFF0F00) + 0x00002022;
+  GPIO_PORTD_PCTL_R = (GPIO_PORTD_PCTL_R & 0xFFFF0F00) + 0x00002022;
 
+  // POTENTIAL REVERT IF GOES WRONG
   SSI1_CR1_R = 0x00000000;       // disable SSI during config
-  SSI1_CPSR_R = 4;               // 20 MHz SSI clock with 80 MHz bus
-  SSI1_CR0_R = 0x0000000F;       // Freescale, SPO=0, SPH=0, 16-bit
+  SSI1_CPSR_R = 0x08;            // 80 MHz / 8 => 10 MHz SSI bit clk (Lab 5)
+  SSI1_CR0_R &= ~(0x0000FFF0);
+  SSI1_CR0_R |= 0x0000000F;      // 16-bit frames
+  SSI1_CR0_R |= 0x00000040;      // same polarity/phase tweak as Lab 5 DAC.c
   SSI1_DR_R = TLV5616_CMD(data); // preload first sample
   SSI1_CR1_R = 0x00000002;       // enable SSI
 }

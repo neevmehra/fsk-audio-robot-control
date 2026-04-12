@@ -32,24 +32,15 @@ int main(void){
     }
   }
 
-  // ── Normal operation ────────────────────────────────────────────────────
-  // SysTick confirmed running. Show command colour.
-  // The LED will also blink at ~1 Hz to prove SysTick keeps counting.
+  // Solid LED = current command (no 50% duty blink — that made direction look random).
   while(1){
-    uint8_t cmd  = Transmitter_GetCommand();
-    // (WaveSamples/4000) & 1  toggles every 4000 SysTick calls = 0.5 s
-    uint8_t blink = (uint8_t)((Transmitter_GetWaveSamples() / 4000u) & 1u);
-
-    if(blink){
-      switch(cmd){
-        case CMD_FORWARD:  LaunchPad_Output(GREEN);  break;
-        case CMD_LEFT:     LaunchPad_Output(BLUE);   break;
-        case CMD_RIGHT:    LaunchPad_Output(RED);    break;
-        case CMD_BACKWARD: LaunchPad_Output(YELLOW); break;
-        default:           LaunchPad_Output(DARK);   break;
-      }
-    } else {
-      LaunchPad_Output(DARK);   // off during the other half of the blink
+    uint8_t cmd = Transmitter_GetCommand();
+    switch(cmd){
+      case CMD_FORWARD:  LaunchPad_Output(GREEN);  break;
+      case CMD_LEFT:     LaunchPad_Output(BLUE);   break;
+      case CMD_RIGHT:    LaunchPad_Output(RED);    break;
+      case CMD_BACKWARD: LaunchPad_Output(YELLOW); break;
+      default:           LaunchPad_Output(DARK);   break;
     }
   }
 }

@@ -1,27 +1,18 @@
 // Transmitter.c
-// Lab 9 — Audio Communication Transmitter (UART-FSK)
+// Lab 9 — Audio Communication Transmitter (continuous tone per command)
 // ECE445L Spring 2025
 //
-// Encoding — UART-like FSK at 100 baud:
-//   f1 = 500 Hz  = mark  (logic 1, idle, stop bit)
-//   f2 = 1000 Hz = space (logic 0, start bit)
+// Encoding — one steady sine per command (matches receiver DFT bins k=1..5 @ 8 kHz, N=16):
+//   STOP=500 Hz, FORWARD=1000 Hz, LEFT=1500 Hz, RIGHT=2000 Hz, BACK=2500 Hz
 //
-//   Frame (10 bits × 10 ms = 100 ms):
-//     [start: f2] [b0 b1 b2 b3 b4 b5 b6 b7] [stop: f1]
-//     LSB first, exactly like UART 8N1.
-//
-//   The current command byte is retransmitted every frame.
-//   Receiver simply watches for start-bit edge and decodes.
-//
-// Hardware:
-//   VRx → PE4 / AIN9 → joy[1]   (X-axis: left/right)
-//   VRy → PE5 / AIN8 → joy[0]   (Y-axis: forward/backward)
+// Hardware (ADC_In89): data[0]=AIN8/PE5, data[1]=AIN9/PE4
+//   Default mapping: joy[1] → left/right, joy[0] → forward/back (see JOY_SWAP_XY)
 //   TLV5616 DAC → SSI1: PD0=SCLK, PD1=FS, PD3=DIN
 //   SW1 (stop) → PF4,  SW2 (back) → PF0
 //
 // Architecture:
-//   Timer0A @ 50 Hz — joystick → CurrentCommand
-//   SysTick @ 8 kHz — UART-FSK encoder → DAC
+//   Timer0A @ 50 Hz — joystick → CurrentCommand (debounced so pitch does not chatter)
+//   SysTick @ 8 kHz — phase increment from command → DAC
 
 #include <stdint.h>
 #include "../inc/tm4c123gh6pm.h"
@@ -29,15 +20,9 @@
 #include "../inc/TLV5616.h"
 #include "../inc/LaunchPad.h"
 #include "Joystick.h"
-#include "CommandFifo.h"
 #include "Transmitter.h"
 
-// ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
-// round(1800 * sin(k * 2*pi / 64)) for k = 0..63
-// ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
-// round(1800 * sin(k * 2*pi / 64)) for k = 0..63
-// ─── 64-point sine table, amplitude ±1800 ────────────────────────────────────
-// round(1800 * sin(k * 2*pi / 64)) for k = 0..63
+// 64-point sine, ±1800 → with SINE_MID gives ~0..4095 span when added full-scale
 static const int16_t Sine64[64] = {
       0,  176,  351,  522,  689,  849, 1000, 1142,
    1273, 1391, 1497, 1588, 1663, 1723, 1765, 1791,
@@ -50,72 +35,101 @@ static const int16_t Sine64[64] = {
 };
 
 #define SINE_MID        2048u
-#define TIMER0A_50HZ 1600000u   // 80 MHz / 50 Hz
-#define SYSTICK_RELOAD   9999u  // 80 MHz / 8000 Hz - 1
+/* Use full table swing for louder speaker drive (was /2 — too quiet for many boards). */
+#define SINE_SCALE_NUM  1
+#define SINE_SCALE_DEN  1
+#define TIMER0A_50HZ    1600000u
+#define SYSTICK_RELOAD  9999u
 
-// UART baud: 100 baud → 80 SysTick calls per bit = 10 ms
-#define BIT_PERIOD    80u
-#define FRAME_BITS    11u
+/* Phase increment per 8 kHz sample: f_Hz = inc * 8000 / 64 = inc * 125 */
+static const uint8_t TxInc[5] = { 4u, 8u, 12u, 16u, 20u };
 
-// ─── Shared state ─────────────────────────────────────────────────────────────
+#define STABLE_NEED  2u
+
 static volatile uint8_t  CurrentCommand = CMD_STOP;
-static volatile uint8_t  Phase1         = 0;
-static volatile uint8_t  Phase2         = 0;
 static volatile uint32_t WaveSamples    = 0;
 static volatile uint32_t InputSamples   = 0;
 
-// UART TX frame state (written only in SysTick context)
-static volatile uint8_t  TxBitIdx   = 0;           // 0=start, 1-8=data, 9=stop
-static volatile uint8_t  TxBitTimer = BIT_PERIOD;
-static volatile uint8_t  TxFrame    = CMD_STOP;     // byte being transmitted
+static volatile uint8_t TxPhase = 0;
 
 // ─── Joystick calibration ─────────────────────────────────────────────────────
 static uint32_t CalCenterX = JOY_CENTER;
 static uint32_t CalCenterY = JOY_CENTER;
 
-static uint8_t LastQueuedCmd = CMD_STOP;
+static uint8_t DebCand  = CMD_STOP;
+static uint8_t DebCount = 0;
 
-static uint8_t EvenParity8(uint8_t b){
-  b ^= b >> 4;
-  b ^= b >> 2;
-  b ^= b >> 1;
-  return b & 1u;
-}
+/* EMA of raw ADC; joy[1]=PE4, joy[0]=PE5 — matches CalCenterX/Y */
+static uint16_t FiltX = JOY_CENTER;
+static uint16_t FiltY = JOY_CENTER;
 
 static void CalibrateJoystick(void){
   uint32_t joy[2], sumX = 0, sumY = 0;
   uint8_t i;
   for(i = 0; i < 32; i++){
     JoyStick_In(joy);
-    sumX += joy[1];   // VRx = AIN9/PE4
-    sumY += joy[0];   // VRy = AIN8/PE5
+    sumX += joy[1];
+    sumY += joy[0];
   }
   CalCenterX = sumX >> 5;
   CalCenterY = sumY >> 5;
 }
 
-// ─── Timer0A ISR @ 50 Hz ─────────────────────────────────────────────────────
+/* Dominant axis wins so diagonals map to one direction; optional swap/invert in Transmitter.h */
 static uint8_t ReadCommand(void){
   uint32_t joy[2];
   uint8_t sw;
-  JoyStick_In(joy);
-  sw = JoyStick_Button();
+  int32_t dx, dy;
+  int32_t adx, ady;
+  int32_t dead = (int32_t)JOY_DEAD;
 
+  JoyStick_In(joy);
+  FiltX = (uint16_t)(((uint32_t)FiltX * 3u + joy[1]) >> 2);
+  FiltY = (uint16_t)(((uint32_t)FiltY * 3u + joy[0]) >> 2);
+
+#if JOY_SWAP_XY
+  dx = (int32_t)FiltY - (int32_t)CalCenterY;
+  dy = (int32_t)FiltX - (int32_t)CalCenterX;
+#else
+  dx = (int32_t)FiltX - (int32_t)CalCenterX;
+  dy = (int32_t)FiltY - (int32_t)CalCenterY;
+#endif
+#if JOY_INVERT_X
+  dx = -dx;
+#endif
+#if JOY_INVERT_Y
+  dy = -dy;
+#endif
+
+  adx = dx >= 0 ? dx : -dx;
+  ady = dy >= 0 ? dy : -dy;
+
+  sw = JoyStick_Button();
   if(sw & 0x02u){
     return CMD_STOP;
   }
 
-  if((int32_t)joy[0] > (int32_t)CalCenterY + (int32_t)JOY_DEAD){
-    return CMD_FORWARD;
+  if(adx <= dead && ady <= dead){
+    if(sw & 0x01u){
+      return CMD_BACKWARD;
+    }
+    return CMD_STOP;
   }
-  if((int32_t)joy[0] < (int32_t)CalCenterY - (int32_t)JOY_DEAD){
-    return CMD_BACKWARD;
-  }
-  if((int32_t)joy[1] > (int32_t)CalCenterX + (int32_t)JOY_DEAD){
-    return CMD_RIGHT;
-  }
-  if((int32_t)joy[1] < (int32_t)CalCenterX - (int32_t)JOY_DEAD){
-    return CMD_LEFT;
+
+  if(ady >= adx){
+    if(dy > dead){
+      return CMD_FORWARD;
+    }
+    if(dy < -dead){
+      return CMD_BACKWARD;
+    }
+  } else {
+    if(dx > dead){
+      return CMD_RIGHT;
+    }
+    if(dx < -dead){
+      return CMD_LEFT;
+    }
   }
 
   if(sw & 0x01u){
@@ -125,58 +139,35 @@ static uint8_t ReadCommand(void){
 }
 
 static void InputTask(void){
-  uint8_t c = ReadCommand();
-  CurrentCommand = c;
-  if(c != LastQueuedCmd){
-    if(CommandFifo_Put(c)){
-      LastQueuedCmd = c;
+  uint8_t r = ReadCommand();
+
+  if(r == CurrentCommand){
+    DebCand  = r;
+    DebCount = 0;
+  } else if(r == DebCand){
+    DebCount++;
+    if(DebCount >= STABLE_NEED){
+      CurrentCommand = r;
+      DebCount = 0;
     }
+  } else {
+    DebCand  = r;
+    DebCount = 1u;
   }
+
   InputSamples++;
 }
 
-// ─── SysTick ISR @ 8 kHz — UART-FSK encoder ─────────────────────────────────
-// Each call outputs one DAC sample.  The bit period timer advances the
-// UART frame one bit at a time.
-//   Bit 0      = start bit → f2 (space, 1000 Hz)
-//   Bits 1–8   = data bits → f1=mark=1, f2=space=0  (LSB first)
-//   Bit 9      = stop bit  → f1 (mark,  500 Hz)
+// ─── SysTick ISR @ 8 kHz — sine from phase increment (command → frequency) ──
 void SysTick_Handler(void){
-  int32_t sample = (int32_t)SINE_MID;
-  uint8_t mark;   // 1 → output f1 (500 Hz),  0 → output f2 (1000 Hz)
+  int32_t sample;
+  uint8_t inc;
 
-  // Determine mark/space for the current bit position
-  if(TxBitIdx == 0){
-    mark = 0u;                                   // start bit = space
-  } else if(TxBitIdx <= 8u){
-    mark = (uint8_t)((TxFrame >> (TxBitIdx - 1u)) & 1u);
-  } else if(TxBitIdx == 9u){
-    mark = EvenParity8(TxFrame);
-  } else {
-    mark = 1u;                                   // stop bit = mark
-  }
+  inc = TxInc[CurrentCommand % 5u];
+  TxPhase = (uint8_t)((TxPhase + inc) & 0x3Fu);
 
-  if(mark){
-    Phase1 = (uint8_t)((Phase1 + INC_F1) & 0x3Fu);
-    sample += Sine64[Phase1] / 2;
-  } else {
-    Phase2 = (uint8_t)((Phase2 + INC_F2) & 0x3Fu);
-    sample += Sine64[Phase2] / 2;
-  }
-
-  TxBitTimer--;
-  if(TxBitTimer == 0u){
-    TxBitTimer = BIT_PERIOD;
-    TxBitIdx++;
-    if(TxBitIdx >= FRAME_BITS){
-      uint8_t next = CMD_STOP;
-      if(!CommandFifo_Get(&next)){
-        next = CurrentCommand;
-      }
-      TxFrame  = next;
-      TxBitIdx = 0;
-    }
-  }
+  sample = (int32_t)SINE_MID;
+  sample += (Sine64[TxPhase] * SINE_SCALE_NUM) / SINE_SCALE_DEN;
 
   if(sample < 0){
     sample = 0;
@@ -188,23 +179,19 @@ void SysTick_Handler(void){
   WaveSamples++;
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
 void Transmitter_Init(void){
   JoyStick_Init();
 
-  CommandFifo_Init();
-  LastQueuedCmd = CMD_STOP;
-  CommandFifo_Put(CMD_STOP);
-
   CurrentCommand = CMD_STOP;
-  Phase1 = Phase2 = 0;
-  InputSamples = WaveSamples = 0;
-  TxFrame    = CMD_STOP;
-  TxBitIdx   = 0;
-  TxBitTimer = BIT_PERIOD;
+  TxPhase        = 0;
+  InputSamples   = 0;
+  WaveSamples    = 0;
+  DebCand        = CMD_STOP;
+  DebCount       = 0;
 
-  // Measure actual joystick resting position — don't touch stick during boot
   CalibrateJoystick();
+  FiltX = (uint16_t)CalCenterX;
+  FiltY = (uint16_t)CalCenterY;
 
   DAC_Init(SINE_MID);
   Timer0A_Init(&InputTask, TIMER0A_50HZ, 3);

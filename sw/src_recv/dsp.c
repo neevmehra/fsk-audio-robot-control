@@ -41,16 +41,37 @@ const int32_t ImW[32] ={
 int32_t x[16];
 int32_t rsum1,isum1;
 int32_t rsum2,isum2;
+int32_t rsum3,isum3,rsum4,isum4,rsum5,isum5;
+
+static const int32_t Re3[16] = {
+  1024, 392, -724, -946, 0, 946, 724, -392, -1024, -392, 724, 946, 0, -946, -724, 392};
+static const int32_t Im3[16] = {
+  0, 946, 724, -392, -1024, -392, 724, 946, 0, -946, -724, 392, 1024, 392, -724, -946};
+static const int32_t Re4[16] = {
+  1024, 0, -1024, 0, 1024, 0, -1024, 0, 1024, 0, -1024, 0, 1024, 0, -1024, 0};
+static const int32_t Im4[16] = {
+  0, 1024, 0, -1024, 0, 1024, 0, -1024, 0, 1024, 0, -1024, 0, 1024, 0, -1024};
+static const int32_t Re5[16] = {
+  1024, -392, -724, 946, 0, -946, 724, 392, -1024, 392, 724, -946, 0, 946, -724, -392};
+static const int32_t Im5[16] = {
+  0, 946, -724, -392, 1024, -392, -724, 946, 0, -946, 724, 392, -1024, 392, 724, -946};
+
 void DFT_Init(void){
   rsum1=isum1=0;
   rsum2=isum2=0;
+  rsum3=isum3=rsum4=isum4=rsum5=isum5=0;
 }
-  // one data point
-void DFT(uint32_t i, int32_t x){
-  rsum1 += x*ReW[i];  
-  isum1 += x*ImW[i];
-  rsum2 += x*ReW[2*i];  
-  isum2 += x*ImW[2*i];
+void DFT(uint32_t i, int32_t samp){
+  rsum1 += samp*ReW[i];
+  isum1 += samp*ImW[i];
+  rsum2 += samp*ReW[2*i];
+  isum2 += samp*ImW[2*i];
+  rsum3 += samp*Re3[i];
+  isum3 += samp*Im3[i];
+  rsum4 += samp*Re4[i];
+  isum4 += samp*Im4[i];
+  rsum5 += samp*Re5[i];
+  isum5 += samp*Im5[i];
 }
 int32_t Mag1(void){int32_t mag;
   rsum1 /= 1024;
@@ -64,6 +85,27 @@ int32_t Mag2(void){int32_t mag;
   isum2 /= 1024;
   mag = rsum2*rsum2+isum2*isum2;
   rsum2=isum2=0;
+  return mag;
+}
+int32_t Mag3(void){int32_t mag;
+  rsum3 /= 1024;
+  isum3 /= 1024;
+  mag = rsum3*rsum3+isum3*isum3;
+  rsum3=isum3=0;
+  return mag;
+}
+int32_t Mag4(void){int32_t mag;
+  rsum4 /= 1024;
+  isum4 /= 1024;
+  mag = rsum4*rsum4+isum4*isum4;
+  rsum4=isum4=0;
+  return mag;
+}
+int32_t Mag5(void){int32_t mag;
+  rsum5 /= 1024;
+  isum5 /= 1024;
+  mag = rsum5*rsum5+isum5*isum5;
+  rsum5=isum5=0;
   return mag;
 }
 int32_t aMag1(void){ // equiv freq = fs/16

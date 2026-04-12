@@ -415,11 +415,6 @@
               <FilePath>.\Transmitter.c</FilePath>
             </File>
             <File>
-              <FileName>CommandFifo.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\CommandFifo.c</FilePath>
-            </File>
-            <File>
               <FileName>ST7735.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\inc\ST7735.c</FilePath>

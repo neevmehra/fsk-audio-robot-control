@@ -3,21 +3,12 @@
 // ECE445L Spring 2025
 //
 // Encoding matches Transmitter.c:
-//   f1 = 500 Hz  = mark  (logic 1)   — DFT bin k=1
-//   f2 = 1000 Hz = space (logic 0)   — DFT bin k=2
-//   100 baud (10 ms/bit)
-//   Frame: start(f2) + 8 data LSB-first + even parity + stop(f1)
+//   One steady tone per command: 500 / 1000 / 1500 / 2000 / 2500 Hz
+//   DFT bins k=1..5 @ fs=8 kHz, N=16 → Mag1..Mag5
 //
 // Timing:
 //   Timer2A ISR @ 8 kHz  → feeds samples into SampleFifo
-//   Main loop DFT: every 16 samples = 2 ms → one frequency decision
-//   WINDOWS_PER_BIT = 5  (10 ms / 2 ms)
-//
-// UART decoder state machine (runs in Receiver_Run):
-//   IDLE  → waits for first f2 (start-bit edge)
-//   SYNC  → waits 2 more DFT windows to centre on start bit, verifies f2
-//   DATA  → samples 8 data bits, then one parity bit
-//   STOP  → verifies stop bit (f1) + even parity, then outputs command
+//   Main loop DFT: every 16 samples = 2 ms → pick strongest bin
 //
 // Hardware:
 //   Microphone (MAX4466) → AIN8 / PE5  (ADC0 SS3)
@@ -37,44 +28,29 @@
 #include "../inc/Timer2A.h"
 #include "Receiver.h"
 
-// ─── Sample FIFO (64 × int32_t) ──────────────────────────────────────────────
 AddIndexFifo(Sample, 64, int32_t, 1, 0)
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-#define RX_SAMPLE_PERIOD   10000u   // Timer2A reload: 80 MHz / 8 kHz
-#define RX_DFT_LEN            16u   // DFT window → one decision every 2 ms
-#define RX_MAG_THRESHOLD    8000u   // min Mag² to count tone as present (raise if false starts)
-// Space (1000 Hz) must exceed mark (500 Hz) by this much to begin a frame — rejects broadband noise
-#define RX_SPACE_OVER_MARK  6000u
-#define RX_STARTUP_TICKS    300u    // ~600 ms @ 2 ms/decode; motors stay stopped while ADC/DFT settle
-#define RX_MOTOR_DUTY      14000u   // PWM duty (2 .. 39998)
+#define RX_SAMPLE_PERIOD   10000u
+#define RX_DFT_LEN            16u
 
-// UART timing: 10 ms/bit = 5 DFT windows per bit
-#define WINDOWS_PER_BIT        5u
-#define SYNC_WAIT              2u   // DFT windows to wait after start-edge
-                                    // → samples near bit centre
+#define RX_TONE_MIN_MAG    6000u
+#define RX_STARTUP_TICKS    300u
+#define RX_STABLE_PICKS       3u
+#define RX_MOTOR_DUTY      14000u
 
-// ─── UART decoder states ──────────────────────────────────────────────────────
-#define STATE_IDLE   0
-#define STATE_SYNC   1
-#define STATE_DATA   2
-#define STATE_STOP   3
-
-// ─── Module state ─────────────────────────────────────────────────────────────
 static volatile uint8_t  CurrentCommand = RX_CMD_STOP;
-static volatile uint32_t LastMag1       = 0;
-static volatile uint32_t LastMag2       = 0;
+static volatile uint32_t LastMag1 = 0;
+static volatile uint32_t LastMag2 = 0;
+static volatile uint32_t LastMag3 = 0;
+static volatile uint32_t LastMag4 = 0;
+static volatile uint32_t LastMag5 = 0;
 
 static uint32_t DftIndex       = 0;
 static uint32_t DisplayDivider = 0;
+static uint32_t RxDecodeTicks  = 0;
 
-// UART decoder
-static uint8_t  UartState   = STATE_IDLE;
-static uint8_t  UartTimer   = 0;    // countdown within current state
-static uint8_t  UartBitCnt  = 0;    // data bits collected so far
-static uint8_t  UartRxByte  = 0;    // byte being assembled
-static uint8_t  UartParityRx = 0;   // received parity bit (0/1)
-static uint32_t RxDecodeTicks = 0; // DFT decode calls since init (for startup mute)
+static uint8_t  LastPick   = 0xFFu;
+static uint8_t  PickAgree  = 0;
 
 // ─── ADC (AIN8/PE5, software-trigger, SS3) ───────────────────────────────────
 static void ReceiverADC_Init(void){
@@ -147,7 +123,33 @@ static void ApplyRobotCommand(uint8_t cmd){
   }
 }
 
-// ─── OLED display (every ~128 ms) ────────────────────────────────────────────
+static uint8_t TonePick(uint32_t m1, uint32_t m2, uint32_t m3, uint32_t m4, uint32_t m5){
+  uint32_t best = m1;
+  uint8_t  win  = RX_CMD_STOP;
+
+  if(m2 > best){ best = m2; win = RX_CMD_FORWARD; }
+  if(m3 > best){ best = m3; win = RX_CMD_LEFT;     }
+  if(m4 > best){ best = m4; win = RX_CMD_RIGHT;    }
+  if(m5 > best){ best = m5; win = RX_CMD_BACKWARD; }
+
+  if(best < RX_TONE_MIN_MAG){
+    return RX_CMD_STOP;
+  }
+  return win;
+}
+
+static void UpdateStableCommand(uint8_t pick){
+  if(pick == LastPick){
+    PickAgree++;
+    if(PickAgree >= RX_STABLE_PICKS){
+      CurrentCommand = pick;
+    }
+  } else {
+    LastPick  = pick;
+    PickAgree = 1u;
+  }
+}
+
 static void UpdateDisplay(void){
   char line[22];
   static const char *const CmdName[5] = {
@@ -167,87 +169,15 @@ static void UpdateDisplay(void){
   snprintf(line, sizeof(line), "M2:%7lu", (unsigned long)LastMag2);
   SSD1306_OutString(line);
 
+  SSD1306_SetCursor(0, 4);
+  snprintf(line, sizeof(line), "M3:%7lu", (unsigned long)LastMag3);
+  SSD1306_OutString(line);
+
   SSD1306_SetCursor(0, 5);
-  snprintf(line, sizeof(line), "St:%d Rx:0x%02X",
-           (int)UartState, (unsigned int)CurrentCommand);
+  snprintf(line, sizeof(line), "min:%5lu", (unsigned long)RX_TONE_MIN_MAG);
   SSD1306_OutString(line);
 }
 
-// ─── UART-FSK decoder (called every DFT window = every 2 ms) ─────────────────
-// has1/has2: quick thresholds; mag1/mag2: raw Mag² — use dominance to avoid noise false starts
-static void UartDecode(uint8_t has1, uint8_t has2, uint32_t mag1, uint32_t mag2){
-  switch(UartState){
-
-    // ── IDLE: real start bit = strong 1000 Hz and clearly stronger than 500 Hz bin ──
-    case STATE_IDLE:
-      if((mag2 > RX_MAG_THRESHOLD) && (mag2 > mag1 + RX_SPACE_OVER_MARK)){
-        UartTimer  = SYNC_WAIT;
-        UartState  = STATE_SYNC;
-      }
-      break;
-
-    // ── SYNC: verify start bit is still present after centering ──────────────
-    case STATE_SYNC:
-      UartTimer--;
-      if(UartTimer == 0){
-        if(has2){
-          // Valid start bit confirmed — prepare to receive 8 data bits
-          UartRxByte = 0;
-          UartBitCnt = 0;
-          UartTimer  = WINDOWS_PER_BIT;
-          UartState  = STATE_DATA;
-        } else {
-          UartState = STATE_IDLE;   // false start, go back
-        }
-      }
-      break;
-
-    // ── DATA: 8 data bits then parity bit ───────────────────────────────────
-    case STATE_DATA:
-      UartTimer--;
-      if(UartTimer == 0){
-        if(UartBitCnt < 8u){
-          if(has1){
-            UartRxByte |= (uint8_t)(1u << UartBitCnt);
-          }
-          UartBitCnt++;
-          UartTimer = WINDOWS_PER_BIT;
-        } else if(UartBitCnt == 8u){
-          UartParityRx = has1 ? 1u : 0u;
-          UartBitCnt   = 9u;
-          UartTimer    = WINDOWS_PER_BIT;
-          UartState    = STATE_STOP;
-        }
-      }
-      break;
-
-    // ── STOP: verify stop bit (f1) + even parity ─────────────────────────────
-    case STATE_STOP:
-      UartTimer--;
-      if(UartTimer == 0){
-        if(has1){
-          uint8_t x = UartRxByte;
-          x ^= x >> 4;
-          x ^= x >> 2;
-          x ^= x >> 1;
-          uint8_t wantP = x & 1u;
-          if((wantP ^ (UartParityRx & 1u)) == 0u){
-            if(UartRxByte <= RX_CMD_BACKWARD){
-              CurrentCommand = UartRxByte;
-            }
-          }
-        }
-        UartState = STATE_IDLE;
-      }
-      break;
-
-    default:
-      UartState = STATE_IDLE;
-      break;
-  }
-}
-
-// ─── Public API ──────────────────────────────────────────────────────────────
 void Receiver_Init(void){
   LaunchPad_Init();
   Bump_Init();
@@ -260,16 +190,12 @@ void Receiver_Init(void){
   ReceiverADC_Init();
 
   CurrentCommand = RX_CMD_STOP;
-  LastMag1       = 0;
-  LastMag2       = 0;
+  LastMag1 = LastMag2 = LastMag3 = LastMag4 = LastMag5 = 0;
   DftIndex       = 0;
   DisplayDivider = 0;
-  UartState      = STATE_IDLE;
-  UartTimer      = 0;
-  UartBitCnt     = 0;
-  UartRxByte     = 0;
-  UartParityRx   = 0;
   RxDecodeTicks  = 0;
+  LastPick       = 0xFFu;
+  PickAgree      = 0;
 
   Timer2A_Init(&SampleTask, RX_SAMPLE_PERIOD, 1);   // 8 kHz, priority 1
 }
@@ -281,17 +207,18 @@ void Receiver_Run(void){
     DftIndex++;
 
     if((DftIndex & (RX_DFT_LEN - 1u)) == 0u){
-      uint8_t has1, has2;
-
-      LastMag1 = (uint32_t)Mag1();   // mag² at f1 = 500 Hz
-      LastMag2 = (uint32_t)Mag2();   // mag² at f2 = 1000 Hz
-
-      has1 = (LastMag1 > RX_MAG_THRESHOLD);
-      has2 = (LastMag2 > RX_MAG_THRESHOLD);
+      LastMag1 = (uint32_t)Mag1();
+      LastMag2 = (uint32_t)Mag2();
+      LastMag3 = (uint32_t)Mag3();
+      LastMag4 = (uint32_t)Mag4();
+      LastMag5 = (uint32_t)Mag5();
 
       RxDecodeTicks++;
 
-      UartDecode(has1, has2, LastMag1, LastMag2);
+      {
+        uint8_t pick = TonePick(LastMag1, LastMag2, LastMag3, LastMag4, LastMag5);
+        UpdateStableCommand(pick);
+      }
 
       if(RxDecodeTicks < RX_STARTUP_TICKS){
         ApplyRobotCommand(RX_CMD_STOP);
@@ -310,4 +237,4 @@ void Receiver_Run(void){
 
 uint8_t  Receiver_GetCommand(void){ return CurrentCommand; }
 uint32_t Receiver_GetMag1(void)   { return LastMag1;       }
-uint32_t Receiver_GetMag2(void)   { return LastMag2        ;}
+uint32_t Receiver_GetMag2(void)   { return LastMag2;       }
