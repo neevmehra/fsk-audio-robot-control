@@ -56,4 +56,8 @@ uint32_t Transmitter_GetInputSamples(void);
 // Returns cumulative count of SysTick DAC writes (for CPU utilisation measurement)
 uint32_t Transmitter_GetWaveSamples(void);
 
+// Returns EMA-filtered raw ADC readings (12-bit, 0..4095) — useful for LCD debug
+uint16_t Transmitter_GetFiltX(void);
+uint16_t Transmitter_GetFiltY(void);
+
 #endif // __TRANSMITTER_H__

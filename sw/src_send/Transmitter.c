@@ -207,3 +207,5 @@ void Transmitter_Init(void){
 uint8_t  Transmitter_GetCommand(void)      { return CurrentCommand; }
 uint32_t Transmitter_GetInputSamples(void) { return InputSamples;   }
 uint32_t Transmitter_GetWaveSamples(void)  { return WaveSamples;    }
+uint16_t Transmitter_GetFiltX(void)        { return FiltX;          }
+uint16_t Transmitter_GetFiltY(void)        { return FiltY;          }
