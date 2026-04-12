@@ -23,17 +23,20 @@
 
 // Joystick: 12-bit ADC, calibrate centre at boot; dead-band (tune if stick drifts)
 #define JOY_CENTER  2048
-#define JOY_DEAD     380
-/* Set to 1 if left/right moves the PE5 channel and forward/back moves PE4 (wiring swap). */
+#define JOY_DEAD     200
+/* Physical forward/back drives PE4 (AIN9, stored as FiltX/dx); left/right drives PE5.
+   JOY_SWAP_XY=1 corrects this so dy tracks forward/back and dx tracks left/right. */
 #ifndef JOY_SWAP_XY
-#define JOY_SWAP_XY  0
+#define JOY_SWAP_XY  1
 #endif
-/* Set to 1 if that axis reads high when you expect the opposite direction. */
+/* Set to 1 if that axis reads high when you expect the opposite direction.
+   JOY_INVERT_Y=1: physical forward gives negative old_dx; after swap that becomes
+   negative dy, which would be BACKWARD — invert to make it FORWARD. */
 #ifndef JOY_INVERT_X
 #define JOY_INVERT_X 0
 #endif
 #ifndef JOY_INVERT_Y
-#define JOY_INVERT_Y 0
+#define JOY_INVERT_Y 1
 #endif
 
 // ── Public interface ──────────────────────────────────────────────────────────
