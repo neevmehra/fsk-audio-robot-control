@@ -37,6 +37,10 @@ AddIndexFifo(Sample, 64, int32_t, 1, 0)
 #define RX_STARTUP_TICKS    300u
 #define RX_STABLE_PICKS       3u
 #define RX_MOTOR_DUTY      14000u
+#define RX_TONE_MIN_MAG      6000u
+#define RX_WIN_MARGIN        1500u   // winner must beat runner-up by this much
+#define RX_STABLE_MOVE_PICKS    3u   // movement commands: require 3 in a row
+#define RX_STABLE_STOP_PICKS    8u   // STOP: require more evidence
 
 static volatile uint8_t  CurrentCommand = RX_CMD_STOP;
 static volatile uint32_t LastMag1 = 0;
@@ -124,24 +128,71 @@ static void ApplyRobotCommand(uint8_t cmd){
 }
 
 static uint8_t TonePick(uint32_t m1, uint32_t m2, uint32_t m3, uint32_t m4, uint32_t m5){
-  uint32_t best = m1;
-  uint8_t  win  = RX_CMD_STOP;
+  uint32_t mags[5];
+  uint32_t best;
+  uint32_t second;
+  uint8_t bestIdx;
+  uint8_t i;
 
-  if(m2 > best){ best = m2; win = RX_CMD_FORWARD; }
-  if(m3 > best){ best = m3; win = RX_CMD_LEFT;     }
-  if(m4 > best){ best = m4; win = RX_CMD_RIGHT;    }
-  if(m5 > best){ best = m5; win = RX_CMD_BACKWARD; }
+  mags[0] = m1; // STOP
+  mags[1] = m2; // FORWARD
+  mags[2] = m3; // LEFT
+  mags[3] = m4; // RIGHT
+  mags[4] = m5; // BACKWARD
 
+  best = mags[0];
+  second = 0;
+  bestIdx = 0;
+
+  for(i = 1; i < 5; i++){
+    if(mags[i] > best){
+      second = best;
+      best = mags[i];
+      bestIdx = i;
+    } else if(mags[i] > second){
+      second = mags[i];
+    }
+  }
+
+  // Signal too weak: treat as STOP
   if(best < RX_TONE_MIN_MAG){
     return RX_CMD_STOP;
   }
-  return win;
+
+  // Winner not dominant enough: treat as STOP
+  if((best - second) < RX_WIN_MARGIN){
+    return RX_CMD_STOP;
+  }
+
+  switch(bestIdx){
+    case 1: return RX_CMD_FORWARD;
+    case 2: return RX_CMD_LEFT;
+    case 3: return RX_CMD_RIGHT;
+    case 4: return RX_CMD_BACKWARD;
+    default:return RX_CMD_STOP;
+  }
 }
 
 static void UpdateStableCommand(uint8_t pick){
+  static uint8_t stopAgree = 0;
+
+  if(pick == RX_CMD_STOP){
+    stopAgree++;
+    if(stopAgree >= RX_STABLE_STOP_PICKS){
+      CurrentCommand = RX_CMD_STOP;
+      stopAgree = RX_STABLE_STOP_PICKS;
+    }
+    return;
+  }
+
+  // Any valid movement command resets stop accumulation
+  stopAgree = 0;
+
   if(pick == LastPick){
-    PickAgree++;
-    if(PickAgree >= RX_STABLE_PICKS){
+    if(PickAgree < RX_STABLE_MOVE_PICKS){
+      PickAgree++;
+    }
+    if(PickAgree >= RX_STABLE_MOVE_PICKS){
       CurrentCommand = pick;
     }
   } else {
