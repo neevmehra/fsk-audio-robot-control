@@ -65,6 +65,10 @@ static uint8_t DebCount = 0;
 static uint16_t FiltX = JOY_CENTER;
 static uint16_t FiltY = JOY_CENTER;
 
+// Add these near the top of Transmitter.c
+volatile uint32_t DebugRawX = 0;
+volatile uint32_t DebugRawY = 0;
+
 static void CalibrateJoystick(void){
   uint32_t joy[2], sumX = 0, sumY = 0;
   uint8_t i;
@@ -85,10 +89,16 @@ static uint8_t ReadCommand(void){
   int32_t adx, ady;
   int32_t dead = (int32_t)JOY_DEAD;
 
+  // --- ADD THESE TWO LINES RIGHT HERE ---
+  DebugRawX = joy[1]; // X-axis (PE4)
+  DebugRawY = joy[0]; // Y-axis (PE5)
+
   JoyStick_In(joy);
+  // EMA Filtering
   FiltX = (uint16_t)(((uint32_t)FiltX * 3u + joy[1]) >> 2);
   FiltY = (uint16_t)(((uint32_t)FiltY * 3u + joy[0]) >> 2);
 
+  // Apply Calibration
 #if JOY_SWAP_XY
   dx = (int32_t)FiltY - (int32_t)CalCenterY;
   dy = (int32_t)FiltX - (int32_t)CalCenterX;
@@ -96,6 +106,7 @@ static uint8_t ReadCommand(void){
   dx = (int32_t)FiltX - (int32_t)CalCenterX;
   dy = (int32_t)FiltY - (int32_t)CalCenterY;
 #endif
+
 #if JOY_INVERT_X
   dx = -dx;
 #endif
@@ -105,41 +116,33 @@ static uint8_t ReadCommand(void){
 
   LastDX = dx;
   LastDY = dy;
-
   adx = dx >= 0 ? dx : -dx;
   ady = dy >= 0 ? dy : -dy;
 
   sw = JoyStick_Button();
-  if(sw & 0x02u){
-    return CMD_STOP;
-  }
 
+  // 1. High Priority: STOP Switch (SW2)
+  if(sw & 0x02u) return CMD_STOP;
+
+  // 2. Deadzone check: If center, check if the BACK switch (SW1) is pressed
   if(adx <= dead && ady <= dead){
-    if(sw & 0x01u){
-      return CMD_BACKWARD;
-    }
+    if(sw & 0x01u) return CMD_FORWARD; // swapped
     return CMD_STOP;
   }
 
-  if(ady >= adx){
-    if(dy > dead){
-      return CMD_FORWARD;
-    }
-    if(dy < -dead){
-      return CMD_BACKWARD;
-    }
+  // 3. Directional Logic: Determine if we are more "Vertical" or "Horizontal"
+  if(ady > adx){
+    // Vertical is dominant
+    if(dy > dead) return CMD_BACKWARD;   // swapped
+    if(dy < -dead) return CMD_FORWARD; // swapped
   } else {
-    if(dx > dead){
-      return CMD_RIGHT;
-    }
-    if(dx < -dead){
-      return CMD_LEFT;
-    }
+    // Horizontal is dominant
+    if(dx > dead) return CMD_RIGHT;
+    if(dx < -dead) return CMD_LEFT;
   }
 
-  if(sw & 0x01u){
-    return CMD_BACKWARD;
-  }
+  // 4. Default fallback: check switch one last time, else STOP
+  //if(sw & 0x01u) return CMD_FORWARD;   // swapped
   return CMD_STOP;
 }
 
