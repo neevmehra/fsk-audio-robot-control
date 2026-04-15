@@ -72,4 +72,13 @@ int32_t  Transmitter_GetDY(void);
 uint32_t Transmitter_GetCalCX(void);
 uint32_t Transmitter_GetCalCY(void);
 
+// ── Unit tests (define RUN_UNIT_TESTS to call these from main) ─────────────────
+// Test_DAC:       validates Sine64 LUT bounds and per-command output range [0,4095]
+// Test_Joystick:  validates direction-mapping logic with known (dx,dy) inputs
+// GetTests*:      read pass/fail counts via debugger or LCD after tests complete
+void     Transmitter_Test_DAC(void);
+void     Transmitter_Test_Joystick(void);
+uint32_t Transmitter_GetTestsPassed(void);
+uint32_t Transmitter_GetTestsFailed(void);
+
 #endif // __TRANSMITTER_H__

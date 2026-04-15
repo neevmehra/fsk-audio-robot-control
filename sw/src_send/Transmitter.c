@@ -221,3 +221,86 @@ int32_t  Transmitter_GetDX(void)           { return LastDX;         }
 int32_t  Transmitter_GetDY(void)           { return LastDY;         }
 uint32_t Transmitter_GetCalCX(void)        { return CalCenterX;     }
 uint32_t Transmitter_GetCalCY(void)        { return CalCenterY;     }
+
+// ─── Unit Tests ───────────────────────────────────────────────────────────────
+// Compile-time gated — define RUN_UNIT_TESTS in project settings to enable.
+// Results accumulate in TestsPassed / TestsFailed; read via getters or debugger.
+
+static volatile uint32_t TestsPassed = 0;
+static volatile uint32_t TestsFailed = 0;
+
+#define TEST_ASSERT(cond)  do { if(cond){ TestsPassed++; } else { TestsFailed++; } } while(0)
+
+// Test 1 — DAC: verify Sine64 LUT range and that every (command, phase) pair
+// produces a 12-bit output value that fits in [0, 4095].
+void Transmitter_Test_DAC(void){
+  uint8_t i;
+
+  // 1a. Every LUT entry must stay within ±1800 (amplitude bound used in Transmitter_Init).
+  for(i = 0; i < 64u; i++){
+    TEST_ASSERT(Sine64[i] >= -1800 && Sine64[i] <= 1800);
+  }
+
+  // 1b. Known spot-checks: zero crossing at index 0 and 32, peak at 16, trough at 48.
+  TEST_ASSERT(Sine64[0]  ==     0);
+  TEST_ASSERT(Sine64[16] ==  1800);
+  TEST_ASSERT(Sine64[32] ==     0);
+  TEST_ASSERT(Sine64[48] == -1800);
+
+  // 1c. Simulate 64 SysTick steps for every command and verify no output clips.
+  {
+    uint8_t cmd, j;
+    for(cmd = 0; cmd < 5u; cmd++){
+      uint8_t phase = 0u;
+      uint8_t inc   = TxInc[cmd % 5u];
+      for(j = 0; j < 64u; j++){
+        phase = (uint8_t)((phase + inc) & 0x3Fu);
+        int32_t sample = (int32_t)SINE_MID
+                       + (Sine64[phase] * SINE_SCALE_NUM) / SINE_SCALE_DEN;
+        TEST_ASSERT(sample >= 0 && sample <= 4095);
+      }
+    }
+  }
+}
+
+// Pure direction-mapping logic mirroring ReadCommand() — operates on pre-computed
+// (dx, dy) so no hardware is required.
+static uint8_t JoyLogic(int32_t dx, int32_t dy){
+  int32_t adx  = dx >= 0 ? dx : -dx;
+  int32_t ady  = dy >= 0 ? dy : -dy;
+  int32_t dead = (int32_t)JOY_DEAD;
+
+  if(adx <= dead && ady <= dead){ return CMD_STOP; }
+  if(ady > adx){
+    if(dy >  dead){ return CMD_BACKWARD; }
+    if(dy < -dead){ return CMD_FORWARD;  }
+  } else {
+    if(dx >  dead){ return CMD_RIGHT; }
+    if(dx < -dead){ return CMD_LEFT;  }
+  }
+  return CMD_STOP;
+}
+
+// Test 2 — Joystick: verify direction mapping for center, four cardinal directions,
+// and two diagonal cases where the dominant axis should win.
+void Transmitter_Test_Joystick(void){
+  int32_t D = (int32_t)JOY_DEAD;
+
+  // Deadband: displacement within ±JOY_DEAD on both axes → STOP
+  TEST_ASSERT(JoyLogic(0,       0)       == CMD_STOP);
+  TEST_ASSERT(JoyLogic(D - 1,   0)       == CMD_STOP);
+  TEST_ASSERT(JoyLogic(0,       D - 1)   == CMD_STOP);
+
+  // Cardinal directions (well outside deadband)
+  TEST_ASSERT(JoyLogic(0,      -(D+300)) == CMD_FORWARD);
+  TEST_ASSERT(JoyLogic(0,       (D+300)) == CMD_BACKWARD);
+  TEST_ASSERT(JoyLogic(-(D+300), 0)      == CMD_LEFT);
+  TEST_ASSERT(JoyLogic( (D+300), 0)      == CMD_RIGHT);
+
+  // Diagonals — dominant axis wins
+  TEST_ASSERT(JoyLogic(D+200, D+500) == CMD_BACKWARD); // |dy| > |dx|
+  TEST_ASSERT(JoyLogic(D+500, D+200) == CMD_RIGHT);    // |dx| > |dy|
+}
+
+uint32_t Transmitter_GetTestsPassed(void){ return TestsPassed; }
+uint32_t Transmitter_GetTestsFailed(void){ return TestsFailed; }

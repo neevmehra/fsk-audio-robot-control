@@ -289,3 +289,68 @@ void Receiver_Run(void){
 uint8_t  Receiver_GetCommand(void){ return CurrentCommand; }
 uint32_t Receiver_GetMag1(void)   { return LastMag1;       }
 uint32_t Receiver_GetMag2(void)   { return LastMag2;       }
+
+// ─── Unit Tests ───────────────────────────────────────────────────────────────
+// Define RUN_UNIT_TESTS at the project level to call these from Lab9R.c main().
+// Results accumulate in RxTestsPassed / RxTestsFailed; read via getters or debugger.
+
+static volatile uint32_t RxTestsPassed = 0;
+static volatile uint32_t RxTestsFailed = 0;
+
+#define RX_TEST_ASSERT(cond)  do { if(cond){ RxTestsPassed++; } else { RxTestsFailed++; } } while(0)
+
+// Test 3 — ADC: collect 64 samples from the FIFO populated by Timer2A and
+// verify every sample is a valid offset-removed 12-bit reading: [-2048, 2047].
+// Call AFTER Receiver_Init() so Timer2A is already running.
+void Receiver_Test_ADC(void){
+  int32_t  sample;
+  uint32_t collected = 0u;
+  uint32_t inRange   = 0u;
+  uint32_t timeout   = 0u;
+
+  while(collected < 64u && timeout < 800000u){
+    if(SampleFifo_Get(&sample)){
+      // SampleTask stores (ADC_raw - 2048), so valid range is [-2048, 2047]
+      if(sample >= -2048 && sample <= 2047){ inRange++; }
+      collected++;
+    }
+    timeout++;
+  }
+
+  // Pass if we received enough samples and all were in range
+  RX_TEST_ASSERT(collected >= 60u);
+  RX_TEST_ASSERT(inRange == collected);
+}
+
+// Test 4 — DFT: feed 16 samples of a pure 1000 Hz sine (= DFT bin k=2, FORWARD
+// command) and verify Mag2 is the dominant bin and exceeds RX_TONE_MIN_MAG.
+//
+// Sample derivation: x[i] = round(1800 * sin(2*pi * 1000/8000 * i))
+//   at fs=8 kHz the 1000 Hz tone completes exactly two cycles over 16 samples.
+void Receiver_Test_DFT(void){
+  static const int32_t tone1000Hz[16] = {
+       0,  1273,  1800,  1273,     0, -1273, -1800, -1273,
+       0,  1273,  1800,  1273,     0, -1273, -1800, -1273
+  };
+  int32_t m1, m2, m3, m4, m5;
+  uint8_t i;
+
+  DFT_Init();
+  for(i = 0u; i < 16u; i++){
+    DFT((uint32_t)i, tone1000Hz[i]);
+  }
+  // Consume all five magnitudes (each call resets its own accumulators)
+  m1 = Mag1(); m2 = Mag2(); m3 = Mag3(); m4 = Mag4(); m5 = Mag5();
+
+  // Bin k=2 must be largest
+  RX_TEST_ASSERT(m2 > m1);
+  RX_TEST_ASSERT(m2 > m3);
+  RX_TEST_ASSERT(m2 > m4);
+  RX_TEST_ASSERT(m2 > m5);
+
+  // Signal must be strong enough to exceed the receiver's minimum detection threshold
+  RX_TEST_ASSERT((uint32_t)m2 > RX_TONE_MIN_MAG);
+}
+
+uint32_t Receiver_GetTestsPassed(void){ return RxTestsPassed; }
+uint32_t Receiver_GetTestsFailed(void){ return RxTestsFailed; }

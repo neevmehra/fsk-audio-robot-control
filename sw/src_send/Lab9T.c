@@ -86,6 +86,29 @@ int main(void){
   ST7735_InitR(INITR_REDTAB);
   ST7735_FillScreen(ST7735_BLACK);
 
+#ifdef RUN_UNIT_TESTS
+  // Run transmitter unit tests before entering the main loop.
+  // Results are visible on the LCD and can be inspected in the debugger via
+  // Transmitter_GetTestsPassed() / Transmitter_GetTestsFailed().
+  Transmitter_Test_DAC();
+  Transmitter_Test_Joystick();
+  {
+    uint32_t passed = Transmitter_GetTestsPassed();
+    uint32_t failed = Transmitter_GetTestsFailed();
+    ST7735_DrawString(0, 0, "Unit Tests", ST7735_WHITE);
+    ST7735_SetCursor(0, 1);
+    ST7735_SetTextColor(failed == 0u ? ST7735_GREEN : ST7735_RED);
+    ST7735_OutString(failed == 0u ? "ALL PASS" : "FAIL");
+    ST7735_SetCursor(0, 2); ST7735_SetTextColor(ST7735_WHITE);
+    ST7735_OutString("Pass:"); ST7735_OutUDec4(passed);
+    ST7735_SetCursor(0, 3);
+    ST7735_OutString("Fail:"); ST7735_OutUDec4(failed);
+    // Pause so the result is readable before the main display overwrites it
+    volatile uint32_t d = 40000000u; while(d--);
+  }
+  ST7735_FillScreen(ST7735_BLACK);
+#endif
+
   // Static labels — drawn once
   ST7735_DrawString(0, 0, "Joystick Debug", ST7735_WHITE);
   ST7735_DrawString(0, 1, "Cmd:",           ST7735_WHITE);

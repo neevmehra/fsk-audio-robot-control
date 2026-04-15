@@ -23,10 +23,19 @@
 
 void Receiver_Init(void);
 void Receiver_Run(void);
-uint8_t Receiver_GetCommand(void);
+uint8_t  Receiver_GetCommand(void);
 uint32_t Receiver_GetMag1(void);
 uint32_t Receiver_GetMag2(void);
 
-
+// ── Unit tests (define RUN_UNIT_TESTS to call these from main) ─────────────────
+// Test_ADC: collects 64 FIFO samples and checks every value is in [-2048, 2047]
+//           (call AFTER Receiver_Init so Timer2A is running)
+// Test_DFT: feeds 16 hardcoded 1000 Hz samples; asserts Mag2 dominates and
+//           exceeds RX_TONE_MIN_MAG (no hardware required)
+// GetTests*: read accumulated pass/fail counts via debugger or OLED display
+void     Receiver_Test_ADC(void);
+void     Receiver_Test_DFT(void);
+uint32_t Receiver_GetTestsPassed(void);
+uint32_t Receiver_GetTestsFailed(void);
 
 #endif
