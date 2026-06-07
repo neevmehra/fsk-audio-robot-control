@@ -124,3 +124,7 @@ The system was tested at both the module and integration levels.
 ## Project Context
 
 This project was completed for ECE445L and focused on real-time embedded systems, digital signal processing, hardware/software integration, and robotics control.
+
+<img width="2160" height="2880" alt="image" src="https://github.com/user-attachments/assets/00215efd-b829-4668-b0ec-7ef62471b797" />
+
+
