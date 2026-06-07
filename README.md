@@ -1,57 +1,126 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/i_Me47iL)
-# Lab 9 Audio Communication System
+# FSK Audio-Based Robot Control System
 
-ECE445L Lab 9 Template.
+Real-time embedded communication system that transmits joystick commands over an acoustic channel using frequency shift keying (FSK), decodes received audio with ADC sampling and DFT-based frequency detection, and controls an RSLK robot.
 
-**NOTE: CCS will not compile for this project, since there are some assembly files in ARMASM syntax, and CCS needs ARMCLANG syntax.**
+## Overview
 
-![Lab 9 README](Lab09.docx)
+This project implements a wireless audio command system using two TM4C123 microcontrollers. The transmitter reads joystick input, maps each direction to a command, encodes the command into an audio signal, and outputs the waveform through a DAC and speaker. The receiver captures the transmitted signal through a microphone, samples it using an ADC, detects the dominant frequency, and drives an RSLK robot based on the decoded command.
 
-IMPORTANT (for those not using Github Classroom): To clone this repository,
-click the green "Use this template" button and create a PRIVATE repository. Do
-NOT clone this repository as you would normally clone a git repo (i.e. using
-'git clone ...') because you will not be able to make a private fork.
+The system was designed to operate in real time while remaining robust to noise and signal distortion in the acoustic channel.
 
-## HW
+## Features
 
-The hw folder should contain your schematic and board files for your PCB or
-circuits. In later labs, you will be creating schematics for your circuit
-in EAGLE. A setup tutorial can be found
-[here](https://www.shawnvictor.net/autodesk-eagle.html).
+* Joystick-controlled robot movement
+* Acoustic command transmission using FSK tones
+* DAC-generated sine wave output through speaker
+* Microphone and ADC-based audio capture
+* DFT-based frequency detection for command decoding
+* FIFO buffering for real-time sample processing
+* Interrupt-driven ADC sampling
+* Stability filtering and thresholding for noise-tolerant decoding
+* RSLK robot control for forward, backward, left, right, and stop commands
 
-## SW
+## System Architecture
 
-The sw folder should contain your application firmware and software written for
-the lab. The sw/inc folder contains firmware drivers written for you by
-Professor Valvano. Feel free to write your own (in fact, in some labs, you may
-be required to write your own).
+1. Joystick input is read by the transmitter microcontroller.
+2. The joystick direction is mapped to a command.
+3. The command is encoded as an FSK audio tone.
+4. The DAC generates the waveform and outputs it through a speaker.
+5. The receiver microphone captures the transmitted audio.
+6. The ADC samples the received signal.
+7. A DFT-based decoder identifies the dominant frequency.
+8. The decoded command is sent to the RSLK robot motor-control logic.
 
-You can place any other source files in the sw/ folder. TAs will look at the
-files you create and/or modify for software quality and for running your
-project.
+## Communication Protocol
 
-## Resources
+The system uses frequency shift keying to represent command data as distinct audio tones. Each command is transmitted over the air through a speaker and decoded by identifying the dominant received frequency.
 
-A couple files are provided in the Resources folder so you don't have to keep
-searching for that one TI document. Some of them are immediately useful, like
-the TM4C datasheet. Others may be useful for your final project, like the
-TM4C_System_Design_Guidelines page.
+The receiver performs frequency-domain analysis using DFT magnitude calculations across expected command frequencies. Thresholding and stability checks help reject transient noise and prevent incorrect command execution.
 
-## Git and Github
+## Technical Implementation
 
-We will extensively use Git and Github for managing lab projects. This makes it
-easier for TAs to grade and help debug the project by allowing the students to
-see commit histories, maintain a common project structure, collaborate with
-partners, merge different codebases, and to debug work.
+### Transmitter
 
-Two common ways of using Git and Github are [Github Desktop](https://desktop.github.com/) and the [command line](https://git-scm.com/downloads). [Tutorials](https://dev.to/mollynem/git-github--workflow-fundamentals-5496) are also abundant on the net for you to peruse. We've provided a cheatsheet for git in the Resources folder.
+* Reads joystick position using ADC inputs
+* Applies directional mapping and deadband logic
+* Converts commands into encoded audio tones
+* Generates sine wave samples using a lookup table
+* Outputs audio through a DAC and speaker circuit
 
-It is highly recommended to make the most out of Git, even if you've never used
-it before. Version control will save you a lot of suffering, and tools like Git
-or SVN are ubiquitous in the industry.
+### Receiver
 
-## Lab Report
+* Samples microphone input using interrupt-driven ADC logic
+* Removes DC offset from sampled audio
+* Buffers samples using FIFO structures
+* Computes DFT magnitudes for target frequencies
+* Selects the dominant frequency based on magnitude and threshold checks
+* Uses stability filtering before executing robot commands
 
-Following the lab doc provided at the root of this project, the TAs request you
-submit a lab report in Microsoft Word (or Pages, if you're a Mac user). Please
-name it `EID_lab_LAB_NUMBER_report.pdf`.
+### Robot Control
+
+* Decoded commands control RSLK robot movement
+* Supported commands include forward, backward, left, right, and stop
+* The system runs within real-time constraints with sufficient CPU timing margin
+
+## Hardware
+
+* TM4C123 microcontrollers
+* RSLK robot platform
+* Joystick input module
+* DAC output circuit
+* Speaker
+* Microphone receiver circuit
+* Breadboarded analog interface circuitry
+* Oscilloscope for waveform validation
+
+## Software
+
+* Embedded C
+* Interrupt-driven ADC sampling
+* DAC waveform generation
+* FIFO buffering
+* DFT-based frequency detection
+* Command decoding and robot-control logic
+
+## Testing
+
+The system was tested at both the module and integration levels.
+
+### Unit Testing
+
+* Verified DAC sine wave output using oscilloscope traces
+* Tested joystick ADC readings and command mapping
+* Validated microphone ADC sampling
+* Tested DFT frequency detection using known input tones
+* Checked frame parsing and command decoding logic
+
+### Integration Testing
+
+* Verified end-to-end joystick-to-robot command transmission
+* Tested real-time robot response to live joystick input
+* Evaluated noise tolerance under background audio interference
+* Measured communication reliability over increasing speaker-to-microphone distance
+* Confirmed timing performance under real-time sampling constraints
+
+## Results
+
+* Successfully transmitted joystick commands over an acoustic channel
+* Controlled an RSLK robot using decoded audio commands
+* Maintained reliable command detection using DFT-based decoding
+* Demonstrated real-time operation with interrupt-driven sampling and FIFO buffering
+* Operated with tolerance to moderate environmental noise
+
+## Repository Structure
+
+```text
+.
+├── README.md
+├── sw/                  # Embedded software
+├── hw/                  # Hardware design files
+├── Resources/           # Supporting resources
+└── docs/                # Lab report and documentation
+```
+
+## Project Context
+
+This project was completed for ECE445L and focused on real-time embedded systems, digital signal processing, hardware/software integration, and robotics control.
